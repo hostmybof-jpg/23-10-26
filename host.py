@@ -748,6 +748,7 @@ def _clear_duplicate_notices(user_id):
 #                                          না দিলেও connection encrypted থাকবে, শুধু
 #                                          cert verify হবে না)
 import pymysql
+import time as _time_module
 import threading as _mysql_threading
 from urllib.parse import urlparse as _urlparse, unquote as _urlunquote, quote as _url_quote
 
@@ -795,41 +796,94 @@ _mysql_local = _mysql_threading.local()
 #   ✅ বাকি ~10,000 লাইন কোড অপরিবর্তিত থাকে (একই _fb_ref path API)
 _SHARD_MAP = {"users": "user", "deposit_requests": "deposit"}
 
+# 🔥 FIX (Error 1040 "Too many connections"):
+# আগে প্রতিটা থ্রেড নিজের connection খুলত কিন্তু থ্রেড শেষ হলে সেটা কখনো বন্ধ হত না
+# (Flask threaded=True প্রতিটা request এ নতুন থ্রেড বানায়), ফলে connection leak হয়ে
+# Aiven এর limit পার হয়ে যেত → deposit handler crash → auto-approve বন্ধ।
+# এখন: সব connection registry তে track হয়; মরা থ্রেড ও idle connection বন্ধ করা হয়;
+# মোট সংখ্যা MYSQL_MAX_CONNS এর মধ্যে রাখা হয়; 1040 এলে purge করে retry করা হয়।
+_MYSQL_MAX_CONNS   = int(os.environ.get("MYSQL_MAX_CONNS", "15"))
+_MYSQL_IDLE_SECS   = int(os.environ.get("MYSQL_IDLE_SECS", "20"))
+_mysql_registry    = {}   # {thread_ident: [conn, thread_obj, last_used]}
+_mysql_reg_lock    = _mysql_threading.RLock()
+
+def _mysql_close_quiet(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+def _mysql_purge(force_idle=0):
+    """মরা থ্রেডের এবং idle connection বন্ধ করো। force_idle>0 হলে সেই সেকেন্ডের বেশি idle গুলোও।"""
+    now = _time_module.time()
+    me = _mysql_threading.get_ident()
+    with _mysql_reg_lock:
+        for ident in list(_mysql_registry.keys()):
+            conn, th, last = _mysql_registry[ident]
+            dead = not th.is_alive()
+            idle = (ident != me) and (now - last > (force_idle or _MYSQL_IDLE_SECS))
+            if dead or idle:
+                _mysql_close_quiet(conn)
+                _mysql_registry.pop(ident, None)
+
 def _get_mysql_conn():
-    """প্রতিটা থ্রেডের নিজস্ব connection — reuse করে, মরে গেলে নতুন করে বানায়।"""
-    conn = getattr(_mysql_local, "conn", None)
-    if conn is not None:
+    """প্রতিটা থ্রেডের নিজস্ব connection — তবে leak ছাড়া ও সীমিত সংখ্যায়।"""
+    me = _mysql_threading.get_ident()
+    with _mysql_reg_lock:
+        entry = _mysql_registry.get(me)
+    if entry is not None:
+        conn = entry[0]
         try:
-            conn.ping()   # deprecated reconnect= আর্গুমেন্ট ছাড়া
+            conn.ping()
+            entry[2] = _time_module.time()
             return conn
         except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            _mysql_local.conn = None
+            _mysql_close_quiet(conn)
+            with _mysql_reg_lock:
+                _mysql_registry.pop(me, None)
+
     import ssl as _ssl_mod
     if _MYSQL_SSL_CA and os.path.exists(_MYSQL_SSL_CA):
         _ssl_ctx = _ssl_mod.create_default_context(cafile=_MYSQL_SSL_CA)
     else:
-        # Aiven require করে encrypted connection (ssl-mode=REQUIRED) কিন্তু আমরা
-        # CA cert দেইনি, তাই encrypt করি কিন্তু cert verify স্কিপ করি।
         _ssl_ctx = _ssl_mod.create_default_context()
         _ssl_ctx.check_hostname = False
         _ssl_ctx.verify_mode = _ssl_mod.CERT_NONE
-    conn = pymysql.connect(
-        host=_MYSQL_HOST,
-        port=_MYSQL_PORT,
-        user=_MYSQL_USER,
-        password=_MYSQL_PASSWORD,
-        database=_MYSQL_DATABASE,
-        ssl=_ssl_ctx,
-        autocommit=True,
-        charset="utf8mb4",
-        connect_timeout=10,
-    )
-    _mysql_local.conn = conn
-    return conn
+
+    last_err = None
+    for attempt in range(8):
+        _mysql_purge()
+        with _mysql_reg_lock:
+            over = len(_mysql_registry) >= _MYSQL_MAX_CONNS
+        if over:
+            _mysql_purge(force_idle=2)   # সীমা পার হলে ২ সেকেন্ডের বেশি idle গুলোও বন্ধ
+        try:
+            conn = pymysql.connect(
+                host=_MYSQL_HOST, port=_MYSQL_PORT, user=_MYSQL_USER,
+                password=_MYSQL_PASSWORD, database=_MYSQL_DATABASE,
+                ssl=_ssl_ctx, autocommit=True, charset="utf8mb4",
+                connect_timeout=10,
+            )
+            with _mysql_reg_lock:
+                _mysql_registry[me] = [conn, _mysql_threading.current_thread(), _time_module.time()]
+            return conn
+        except pymysql.err.OperationalError as e:
+            last_err = e
+            if e.args and e.args[0] == 1040:      # Too many connections
+                _mysql_purge(force_idle=1)
+                _time_module.sleep(0.3 * (attempt + 1))
+                continue
+            raise
+    raise last_err
+
+def _mysql_idle_reaper():
+    """ব্যাকগ্রাউন্ডে নিয়মিত মরা/idle connection পরিষ্কার করে।"""
+    while True:
+        _time_module.sleep(15)
+        try:
+            _mysql_purge()
+        except Exception:
+            pass
 
 def _mysql_init_table():
     try:
@@ -1178,6 +1232,7 @@ class _MySQLRef:
         return True
 
 _mysql_init_table()
+_mysql_threading.Thread(target=_mysql_idle_reaper, daemon=True, name="mysql_reaper").start()
 
 def _fb_ref(path="/"):
     return _MySQLRef(path)
