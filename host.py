@@ -508,6 +508,10 @@ def _graceful_shutdown(signum, frame):
         logging.info(f"⚠️ Shutdown signal ({signum}) পাওয়া গেছে — pending MySQL write flush করা হচ্ছে...")
         print(f"⚠️ Shutdown signal ({signum}) — flushing pending MySQL writes before exit...")
         _EXECUTOR.shutdown(wait=True, cancel_futures=False)
+        try:
+            stock_sync_flush_all()   # 💾 লোকাল স্টক ফাইল MySQL এ শেষবার সেভ
+        except Exception as _sf_e:
+            logging.error(f"stock flush on shutdown failed: {_sf_e}")
         print("✅ সব pending MySQL write সম্পন্ন — নিরাপদে বন্ধ হচ্ছে।")
     except Exception as e:
         logging.error(f"_graceful_shutdown error: {e}")
@@ -5920,6 +5924,247 @@ LOG_FILE  = "bot_logs.txt"
 if not os.path.exists(STOCK_DIR):
     os.makedirs(STOCK_DIR)
 
+# ═══════════════════════════════════════════════════════════
+# 💾 LOCAL STOCK → MySQL PERSISTENCE
+# ═══════════════════════════════════════════════════════════
+# সমস্যা: লোকাল স্টক stocks/*.xlsx ডিস্কে থাকে। Railway/Render/Docker এ
+# redeploy বা restart হলে ডিস্ক মুছে যায় → লোকাল স্টক হারিয়ে যেত।
+#
+# সমাধান: stocks/ ফোল্ডার এখনও "working copy" হিসেবে থাকে (বাকি সব কোড
+# আগের মতোই কাজ করে), কিন্তু প্রতিটা .xlsx ফাইল MySQL এর bot_stock_files
+# টেবিলে অটো-সেভ হয়:
+#   • Startup এ MySQL থেকে সব স্টক ফাইল stocks/ এ ফিরিয়ে আনা হয়
+#   • ফাইল বদলালে (upload / বিক্রি / restore / rename / delete) ~২ সেকেন্ডের
+#     মধ্যে MySQL এ আপডেট হয় (invalidate_stock_cache() কল হলেই সাথে সাথে)
+#   • Shutdown (SIGTERM) এ শেষবার flush হয়
+#   • আগে থেকে ডিস্কে থাকা পুরনো স্টক ফাইল প্রথমবার চালালেই MySQL এ উঠে যায়
+import zipfile as _zipfile_stock
+import hashlib as _hashlib_stock
+
+_STOCK_SYNC_INTERVAL = 2.0
+_stock_sync_wake     = threading.Event()
+_stock_sync_pass_lock = threading.Lock()
+_stock_sync_known    = {}   # {file_name: sha256 — MySQL এ যেটা আছে}
+_stock_sync_sig      = {}   # {file_name: (mtime_ns, size) — শেষবার যেটা দেখা হয়েছে}
+_stock_sync_missing  = {}   # {file_name: পরপর কতবার ডিস্কে পাওয়া যায়নি}
+_stock_sync_ready    = False
+_stock_sync_thread   = None
+
+
+def _stock_sync_kick():
+    """Stock ফাইল বদলেছে — sync worker কে এখনই জাগাও।"""
+    _stock_sync_wake.set()
+
+
+def _stock_sync_init_table():
+    conn = _get_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_stock_files (
+                file_name  VARCHAR(191) PRIMARY KEY,
+                file_data  LONGBLOB NOT NULL,
+                file_hash  CHAR(64)  NOT NULL,
+                file_mtime BIGINT    NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
+
+def _stock_sync_list_disk():
+    try:
+        names = os.listdir(STOCK_DIR)
+    except Exception:
+        return []
+    return [n for n in names
+            if n.lower().endswith(".xlsx") and not n.startswith("~$")
+            and os.path.isfile(os.path.join(STOCK_DIR, n))]
+
+
+def _stock_sync_push(fname):
+    """একটা stock ফাইল MySQL এ আপলোড (শুধু বদলালে)। True = সফল/অপরিবর্তিত।"""
+    path = os.path.join(STOCK_DIR, fname)
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return True
+    sig = (st.st_mtime_ns, st.st_size)
+    if _stock_sync_sig.get(fname) == sig and fname in _stock_sync_known:
+        return True
+
+    lock = get_stock_lock(fname[:-5])
+    got = lock.acquire(timeout=5)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        st = os.stat(path)
+    except FileNotFoundError:
+        return True
+    finally:
+        if got:
+            lock.release()
+
+    sig = (st.st_mtime_ns, st.st_size)
+    # আধা-লেখা ফাইল আপলোড করা যাবে না — ZIP ঠিক আছে কিনা যাচাই
+    try:
+        import io as _io_ss
+        if not _zipfile_stock.is_zipfile(_io_ss.BytesIO(data)):
+            return False
+        with _zipfile_stock.ZipFile(_io_ss.BytesIO(data)) as _z:
+            if _z.testzip() is not None:
+                return False
+    except Exception:
+        return False
+
+    h = _hashlib_stock.sha256(data).hexdigest()
+    if _stock_sync_known.get(fname) == h:
+        _stock_sync_sig[fname] = sig
+        return True
+
+    conn = _get_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO bot_stock_files (file_name, file_data, file_hash, file_mtime) "
+            "VALUES (%s,%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE file_data=VALUES(file_data), "
+            "file_hash=VALUES(file_hash), file_mtime=VALUES(file_mtime)",
+            (fname, data, h, int(st.st_mtime))
+        )
+    _stock_sync_known[fname] = h
+    _stock_sync_sig[fname] = sig
+    return True
+
+
+def _stock_sync_delete(fname):
+    conn = _get_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM bot_stock_files WHERE file_name=%s", (fname,))
+    _stock_sync_known.pop(fname, None)
+    _stock_sync_sig.pop(fname, None)
+    _stock_sync_missing.pop(fname, None)
+
+
+def _stock_sync_pass():
+    """ডিস্ক ↔ MySQL এক দফা sync (নতুন/বদলানো ফাইল আপলোড, মোছা ফাইল ডিলিট)।"""
+    if not _stock_sync_ready:
+        return
+    with _stock_sync_pass_lock:
+        on_disk = set(_stock_sync_list_disk())
+        for fname in sorted(on_disk):
+            _stock_sync_missing.pop(fname, None)
+            try:
+                _stock_sync_push(fname)
+            except Exception as e:
+                logging.error(f"Stock sync push error [{fname}]: {e}")
+        # ডিস্ক থেকে মুছে গেছে (product delete / rename) → MySQL থেকেও মোছো
+        # (পরপর ২ বার না পেলে তবেই — rename/replace এর মাঝের মুহূর্ত এড়াতে)
+        for fname in list(_stock_sync_known.keys()):
+            if fname in on_disk:
+                continue
+            _stock_sync_missing[fname] = _stock_sync_missing.get(fname, 0) + 1
+            if _stock_sync_missing[fname] >= 2:
+                try:
+                    _stock_delete_ok = True
+                    _stock_sync_delete(fname)
+                except Exception as e:
+                    logging.error(f"Stock sync delete error [{fname}]: {e}")
+
+
+def stock_sync_restore_from_mysql():
+    """Startup: MySQL এ থাকা সব স্টক ফাইল stocks/ এ ফিরিয়ে আনো।
+    ডিস্কে একই ফাইল থাকলে যেটার mtime নতুন সেটা জেতে (crash এর আগের শেষ
+    পরিবর্তন যেন হারিয়ে না যায়)। সফল হলে True।"""
+    global _stock_sync_ready
+    os.makedirs(STOCK_DIR, exist_ok=True)
+    _stock_sync_init_table()
+    conn = _get_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT file_name, file_hash, file_mtime FROM bot_stock_files")
+        rows = cur.fetchall()
+
+    restored = 0
+    for fname, fhash, fmtime in rows:
+        path = os.path.join(STOCK_DIR, fname)
+        use_db = True
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    disk_hash = _hashlib_stock.sha256(f.read()).hexdigest()
+                if disk_hash == fhash:
+                    use_db = False
+                    _stock_sync_known[fname] = fhash
+                elif int(os.path.getmtime(path)) > int(fmtime) + 1:
+                    # ডিস্কের ফাইল নতুন → ওটাই রাখো, প্রথম pass এ MySQL এ উঠবে
+                    use_db = False
+                    _stock_sync_known[fname] = fhash
+            except Exception:
+                pass
+        if not use_db:
+            continue
+        with conn.cursor() as cur:
+            cur.execute("SELECT file_data FROM bot_stock_files WHERE file_name=%s", (fname,))
+            r = cur.fetchone()
+        if not r:
+            continue
+        data = bytes(r[0])
+        tmp = path + ".restore.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        try:
+            os.utime(path, (int(fmtime), int(fmtime)))
+        except Exception:
+            pass
+        _stock_sync_known[fname] = fhash
+        restored += 1
+
+    _stock_sync_ready = True
+    print(f"✅ Local stock restore: MySQL এ {len(rows)}টা ফাইল | ডিস্কে ফিরিয়ে আনা হয়েছে: {restored}টা")
+    return True
+
+
+def stock_sync_flush_all():
+    """Shutdown/redeploy এর আগে সব pending stock পরিবর্তন MySQL এ লিখে দাও।"""
+    try:
+        _stock_sync_pass()
+    except Exception as e:
+        logging.error(f"stock_sync_flush_all error: {e}")
+
+
+def _stock_sync_worker():
+    import time as _t_ss
+    while True:
+        try:
+            if not _stock_sync_ready:
+                try:
+                    stock_sync_restore_from_mysql()
+                except Exception as e:
+                    logging.error(f"Stock restore retry failed: {e}")
+                    _t_ss.sleep(10)
+                    continue
+            _stock_sync_pass()
+        except Exception as e:
+            logging.error(f"Stock sync worker error: {e}")
+        _stock_sync_wake.wait(_STOCK_SYNC_INTERVAL)
+        _stock_sync_wake.clear()
+
+
+def stock_sync_start():
+    """Bot চালুর সময় একবার কল হয় — আগে restore, তারপর background sync চালু।"""
+    global _stock_sync_thread
+    for attempt in range(3):
+        try:
+            stock_sync_restore_from_mysql()
+            break
+        except Exception as e:
+            logging.error(f"Stock restore attempt {attempt+1} failed: {e}")
+            print(f"⚠️ Local stock restore ব্যর্থ ({attempt+1}/3): {e}")
+            import time as _t_ss2
+            _t_ss2.sleep(2)
+    _stock_sync_thread = threading.Thread(target=_stock_sync_worker, daemon=True, name="stock_sync")
+    _stock_sync_thread.start()
+    print("✅ Local stock → MySQL auto-sync worker started")
+
+
 # ===========================
 # REAL TIME HELPER (UTC+6 Bangladesh / International)
 # ===========================
@@ -10750,6 +10995,10 @@ def get_stock_count(product_name):
 def invalidate_stock_cache(product_name):
     """Stock write হলে cache clear করো। Sub-product গুলোও clear হবে।"""
     _stock_count_cache.pop(product_name, None)
+    try:
+        _stock_sync_kick()   # 💾 লোকাল স্টক বদলেছে → MySQL এ সেভ করো
+    except Exception:
+        pass
     prefix = product_name + "__"
     for k in [k for k in list(_stock_count_cache.keys()) if k.startswith(prefix)]:
         _stock_count_cache.pop(k, None)
@@ -13456,7 +13705,7 @@ def _nineproxy_bulk_password(used):
     return "".join(random.choices(string.ascii_lowercase, k=12))
 
 
-def _nineproxy_bulk_make_one(mb, note, used_pw, lock):
+def _nineproxy_bulk_make_one(mb, note, used_pw, lock, fixed_pw=None):
     """একটা unique username+password দিয়ে 9Proxy তে একটা sub-user বানায়।
     username accept না হলে (আগে থেকেই আছে ইত্যাদি) নতুন username দিয়ে আবার চেষ্টা করে।
     রিটার্ন: (username, password, error)"""
@@ -13464,7 +13713,7 @@ def _nineproxy_bulk_make_one(mb, note, used_pw, lock):
     for _ in range(6):
         with lock:
             uname = _nineproxy_fallback_username()
-            pw = _nineproxy_bulk_password(used_pw)
+            pw = fixed_pw or _nineproxy_bulk_password(used_pw)   # admin password দিলে সবগুলোতে সেটাই
         u, p, err = nineproxy_create_userpass(uname, pw, mb, note=note)
         if not err and u:
             return u, p, None
@@ -13507,13 +13756,55 @@ def admin_nineproxyapi_bulk_qty_step(message, idx):
         pkg = packages[idx - 1]
     except Exception:
         bot.send_message(chat_id, "❌ প্যাকেজ পাওয়া যায়নি!"); return
+    # 🔑 Password জিজ্ঞেস করো — দিলে সবগুলো account এ সেটাই হবে, Skip করলে random
+    _pw_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    _pw_markup.add(KbBtn("⏭ Skip"))
+    _pw_markup.add(KbBtn(LANG[get_user_lang(chat_id)]["cancel"], role="cancel"))
+    msg = bot.send_message(chat_id,
+        f"🔑 <b>Password দিন</b>\n\n"
+        f"দিলে <b>{qty}টা account এর সবগুলোতেই</b> এই একই password হবে।\n"
+        f"<i>নিয়ম: শুধু ছোট হাতের ইংরেজি অক্ষর (a-z), ৩-২০ ক্যারেক্টার।</i>\n\n"
+        f"চাইলে <b>⏭ Skip</b> চাপুন — প্রতিটা account এ আলাদা random password হবে।",
+        parse_mode="HTML", reply_markup=_pw_markup)
+    bot.register_next_step_handler(msg, lambda m: admin_nineproxyapi_bulk_pw_step(m, idx, qty))
+
+
+def admin_nineproxyapi_bulk_pw_step(message, idx, qty):
+    chat_id = message.chat.id
+    txt = str(message.text or "").strip()
+    _cancel_labels = {"❌ Cancel", "❌ বাতিল"}
+    try:
+        _cancel_labels |= {v.get("cancel") for v in LANG.values() if isinstance(v, dict) and v.get("cancel")}
+    except Exception:
+        pass
+    if txt in _cancel_labels:
+        bot.send_message(chat_id, "❌ বাতিল করা হয়েছে।", reply_markup=get_main_menu(str(chat_id)))
+        show_nineproxyapi_admin_panel(chat_id); return
+    fixed_pw = None
+    if txt.lower().lstrip("/").replace("⏭", "").strip() != "skip":
+        if not _NINEPROXY_CRED_RE.match(txt):
+            _pw_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+            _pw_markup.add(KbBtn("⏭ Skip"))
+            _pw_markup.add(KbBtn(LANG[get_user_lang(chat_id)]["cancel"], role="cancel"))
+            msg = bot.send_message(chat_id,
+                "❌ <b>Password সঠিক নয়!</b>\nশুধু ছোট হাতের ইংরেজি অক্ষর (a-z), ৩-২০ ক্যারেক্টার। "
+                "আবার দিন, অথবা ⏭ Skip চাপুন:",
+                parse_mode="HTML", reply_markup=_pw_markup)
+            bot.register_next_step_handler(msg, lambda m: admin_nineproxyapi_bulk_pw_step(m, idx, qty)); return
+        fixed_pw = txt
+    packages = get_nineproxy_api_packages()
+    try:
+        pkg = packages[idx - 1]
+    except Exception:
+        bot.send_message(chat_id, "❌ প্যাকেজ পাওয়া যায়নি!"); return
+    pw_note = f"🔑 Password: <code>{_bm_html.escape(fixed_pw)}</code> (সবগুলোতে একই)" if fixed_pw else "🔑 Password: random (প্রতিটায় আলাদা)"
     status = bot.send_message(chat_id,
-        f"⏳ <b>{qty} pcs generate হচ্ছে...</b>\n<i>একটু অপেক্ষা করুন।</i>",
+        f"⏳ <b>{qty} pcs generate হচ্ছে...</b>\n{pw_note}\n<i>একটু অপেক্ষা করুন।</i>",
         parse_mode="HTML", reply_markup=get_main_menu(str(chat_id)))
-    _EXECUTOR.submit(_nineproxy_bulk_worker, chat_id, status.message_id, pkg, qty)
+    _EXECUTOR.submit(_nineproxy_bulk_worker, chat_id, status.message_id, pkg, qty, fixed_pw)
 
 
-def _nineproxy_bulk_worker(chat_id, status_mid, pkg, qty):
+def _nineproxy_bulk_worker(chat_id, status_mid, pkg, qty, fixed_pw=None):
     """Bulk generate — মাঝপথে error এলেও (rate limit / bandwidth শেষ / network ইত্যাদি)
     যতগুলো সফলভাবে generate হয়েছে সবগুলো sheet এ দিয়ে দেয়।"""
     mb = pkg.get("mb", 0)
@@ -13529,7 +13820,7 @@ def _nineproxy_bulk_worker(chat_id, status_mid, pkg, qty):
         if state["aborted"]:
             return
         try:
-            u, p, err = _nineproxy_bulk_make_one(mb, f"TG-ADMIN-BULK-{name}", used_pw, lock)
+            u, p, err = _nineproxy_bulk_make_one(mb, f"TG-ADMIN-BULK-{name}", used_pw, lock, fixed_pw)
         except Exception as ex_:
             u, p, err = None, None, f"{type(ex_).__name__}: {ex_}"
         with lock:
@@ -13573,6 +13864,8 @@ def _nineproxy_bulk_worker(chat_id, status_mid, pkg, qty):
             safe_name = re.sub(r"[^A-Za-z0-9]+", "_", str(name)).strip("_") or "pkg"
             buf.name = f"9proxy_bulk_{safe_name}_{len(rows)}pcs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             cap = f"✅ <b>9Proxy Bulk</b> — {name} ({mb}MB)\n📦 Generated: <b>{len(rows)}</b>/{qty}"
+            if fixed_pw:
+                cap += f"\n🔑 Password (সবগুলোতে): <code>{_bm_html.escape(fixed_pw)}</code>"
             if len(rows) < qty:
                 cap += f"\n⚠️ বাকি {qty - len(rows)}টা হয়নি — যতগুলো হয়েছে সবগুলো এই sheet এ আছে"
             bot.send_document(chat_id, buf, caption=cap, parse_mode="HTML")
@@ -34161,6 +34454,9 @@ if __name__ == "__main__":
     print(f"📦 Stock Cache TTL: {_STOCK_CACHE_TTL}s")
     print(f"⚡ Callback ACK: INSTANT (pre-answer + thread pool)")
     print("=" * 60)
+
+    # 💾 লোকাল স্টক MySQL থেকে restore + auto-sync চালু (সবার আগে)
+    stock_sync_start()
 
     # Edu Mail/Hotmail/Outlook price auto-init
     auto_init_sub_products()
