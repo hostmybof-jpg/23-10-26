@@ -8038,11 +8038,14 @@ GMAIL_PLATFORMS = {
     "gm_canva":     {"product": "Gmail Canva",     "name": "Canva",     "emoji": "🎨"},
     "gm_chatgpt":   {"product": "Gmail ChatGPT",   "name": "ChatGPT",   "emoji": "🤖"},
     "gm_claude":    {"product": "Gmail Claude AI", "name": "Claude AI", "emoji": "✨"},
+    "gm_kalshi":    {"product": "Gmail Kalshi",    "name": "Kalshi",    "emoji": "📈"},
 }
 # প্রথম ৫টার বাইরে যেগুলো পরে যোগ হয়েছে — পুরোনো DB তেও একবার product বানাতে (gmail_products_init_v2)
 GMAIL_NEW_PLATFORM_KEYS = ["gm_amazon", "gm_whatsapp", "gm_twitter", "gm_discord", "gm_microsoft", "gm_pinterest",
                            "gm_linkedin", "gm_snapchat", "gm_spotify", "gm_netflix", "gm_github", "gm_viber",
                            "gm_reddit", "gm_canva", "gm_chatgpt", "gm_claude"]
+# v3 — Kalshi (পুরোনো DB তে একবার product বানাতে — gmail_products_init_v3)
+GMAIL_NEW_PLATFORM_KEYS_V3 = ["gm_kalshi"]
 GMAIL_PRODUCT_TO_KEY = {m["product"]: k for k, m in GMAIL_PLATFORMS.items()}
 OTP_PAGE_PATH = "/otp"
 
@@ -8074,6 +8077,7 @@ GMAIL_SENDERS = {          # প্ল্যাটফর্ম -> প্রে�
     "gm_canva": ["canva.com"],
     "gm_chatgpt": ["openai.com"],
     "gm_claude": ["anthropic.com"],
+    "gm_kalshi": ["kalshi.com"],
 }
 
 GMAIL_BOXES = ["INBOX", "[Gmail]/Spam"]
@@ -8096,6 +8100,7 @@ _GM_CODE_RE = {            # প্ল্যাটফর্ম -> কোডে�
     "gm_canva": r"(?<![\d.])(\d{6})(?![\d.])",
     "gm_chatgpt": r"(?<![\d.])(\d{6})(?![\d.])",
     "gm_claude": r"(?<![\d.])(\d{6})(?![\d.])",
+    "gm_kalshi": r"(?<![\d.])(\d{6})(?![\d.])",
 }
 
 def _gm_decode(v):
@@ -8266,8 +8271,8 @@ def _gm_e(v):
 
 def _gm_public_url():
     u = (os.environ.get("PUBLIC_URL", "") or RAILWAY_URL or "").strip().rstrip("/")
-    if u and not u.startswith(("http://", "https://")):
-        u = "https://" + u
+    if u:
+        u = "https://" + re.sub(r"^[a-zA-Z]+://", "", u)   # 🔒 সবসময় https:// (http:// বা শুধু ডোমেইন হলেও)
     return u
 
 
@@ -9304,6 +9309,313 @@ def gm_otp_web_data(token):
     return _gm_web_resp(json.dumps({"ok": True, "platform": _gm_pname(plat), "emails": out}, ensure_ascii=False),
                         200, "application/json")
 
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 🔎 ADMIN ONLY — MAIL CHECKER (Telegram Mini App)
+#    Admin Panel → 🔎 Mail Checker → মেইল পেস্ট করলে প্রতিটা মেইলের জন্য দেখায়:
+#      • 🔴 Used  — কোন কোন Gmail API সার্ভিসে আগে বিক্রি হয়েছে
+#      • 🟡 স্টকে — কোন কোন সার্ভিসের স্টকে এখন আছে
+#      • ♻️ Duplicate — ইনপুটে একাধিকবার / স্টক ফাইলে একাধিকবার / বিক্রিত হয়েও স্টকে আছে
+#      • 🔐 Login — IMAP দিয়ে আসলেই লগইন হয় কিনা (ঐচ্ছিক)
+#    ইনপুট ফরম্যাট: `email` অথবা `email|app_password` (পাসওয়ার্ড না দিলে স্টক ফাইল থেকে নেওয়া হয়)।
+#    🔒 সিকিউরিটি: Telegram initData HMAC যাচাই (BOT_TOKEN দিয়ে) + is_admin() চেক —
+#    শুধু ফ্রন্টএন্ডে বাটন লুকানো না, backend API নিজেই admin ছাড়া সবাইকে 403 দেয়।
+#    App Password কখনো রেসপন্সে/লগে যায় না।
+# ───────────────────────────────────────────────────────────────────────────
+_GM_CHK_PATH = "/admin/mailcheck"
+_GM_CHK_MAX = 500            # এক রিকোয়েস্টে সর্বোচ্চ মেইল (used/duplicate চেক)
+_GM_CHK_LOGIN_BATCH = 25     # এক login-রিকোয়েস্টে সর্বোচ্চ মেইল
+_GM_CHK_LOGIN_WORKERS = 6    # একসাথে কয়টা IMAP লগইন (Google rate-limit এড়াতে কম রাখা)
+_GM_CHK_AUTH_MAX_AGE = 3600  # initData কতক্ষণ বৈধ (সেকেন্ড)
+_GM_CHK_FIND_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_gm_chk_pw_cache = {"t": 0, "d": {}}   # {ekey: password} — স্টক থেকে, ৬০ সেকেন্ড cache (শুধু মেমরিতে)
+
+
+def _gm_chk_url():
+    base = _gm_public_url()          # ইতোমধ্যে জোর করে https://
+    return f"{base}{_GM_CHK_PATH}" if base else ""
+
+
+def _gm_chk_auth(init_data):
+    """Telegram WebApp initData যাচাই করে admin হলে user_id (str) রিটার্ন করে, নইলে None।"""
+    try:
+        from urllib.parse import parse_qsl
+        pairs = dict(parse_qsl(init_data or "", keep_blank_values=True))
+        got_hash = pairs.pop("hash", "")
+        if not got_hash:
+            return None
+        dcs = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
+        secret = hmac.new(b"WebAppData", str(API_TOKEN).strip().encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, got_hash):
+            return None
+        if _gm_time.time() - int(pairs.get("auth_date", "0") or 0) > _GM_CHK_AUTH_MAX_AGE:
+            return None
+        uid = str(json.loads(pairs.get("user", "{}")).get("id", ""))
+        return uid if uid and is_admin(uid) else None
+    except Exception:
+        return None
+
+
+def _gm_chk_parse(text):
+    """ইনপুট -> (unique emails [order রেখে], {email: কতবার}, {email: password})।"""
+    order, counts, pws = [], {}, {}
+    for line in str(text or "")[:300000].splitlines():
+        it = _gm_parse_line(line)
+        if it:
+            found = [(it[0].strip().lower(), it[1])]
+        else:
+            found = [(m.strip().lower(), None) for m in _GM_CHK_FIND_RE.findall(line)]
+        for em, pw in found:
+            if em not in counts:
+                counts[em] = 0
+                order.append(em)
+            counts[em] += 1
+            if pw and em not in pws:
+                pws[em] = pw
+    return order, counts, pws
+
+
+def _gm_chk_stock_scan(product_name, with_pw=False):
+    """একটা সার্ভিসের স্টক ফাইল -> ({ekey: কতবার আছে}, {ekey: password} (with_pw হলে))।"""
+    path = os.path.join(STOCK_DIR, f"{product_name}.xlsx")
+    cnt, pw = {}, {}
+    if not os.path.exists(path):
+        return cnt, pw
+    try:
+        with get_stock_lock(product_name):
+            wb = openpyxl.load_workbook(path, read_only=True)
+            for i, r in enumerate(wb.active.iter_rows(values_only=True)):
+                if i == 0:
+                    continue
+                it = _gm_row_to_item(["" if c is None else str(c) for c in r])
+                if it:
+                    ek = _gm_ekey(it[0])
+                    cnt[ek] = cnt.get(ek, 0) + 1
+                    if with_pw and ek not in pw:
+                        pw[ek] = it[1]
+            wb.close()
+    except Exception as e:
+        logging.warning(f"mailcheck stock read error ({product_name}): {e}")
+    return cnt, pw
+
+
+def _gm_chk_stock_pw():
+    """সব সার্ভিসের স্টক থেকে {ekey: password} (৬০ সেকেন্ড cache)।"""
+    now = _gm_time.time()
+    if now - _gm_chk_pw_cache["t"] < 60 and _gm_chk_pw_cache["d"]:
+        return _gm_chk_pw_cache["d"]
+    db = load_db()
+    allpw = {}
+    for meta in GMAIL_PLATFORMS.values():
+        if meta["product"] in db.get("products", {}):
+            _c, pw = _gm_chk_stock_scan(meta["product"], with_pw=True)
+            for k, v in pw.items():
+                allpw.setdefault(k, v)
+    _gm_chk_pw_cache["t"], _gm_chk_pw_cache["d"] = now, allpw
+    return allpw
+
+
+def _gm_chk_run(emails, counts, pws):
+    """Used / স্টক / Duplicate চেক। পাসওয়ার্ড রেসপন্সে যায় না — শুধু has_pw ফ্ল্যাগ।"""
+    db = load_db()
+    sold, stock, label = {}, {}, {}
+    stock_pw = {}
+    for key, meta in GMAIL_PLATFORMS.items():
+        label[key] = f"{meta['emoji']} {meta['name']}"
+        sold[key] = _gm_sold_set(key)
+        if meta["product"] in db.get("products", {}):
+            stock[key], _p = _gm_chk_stock_scan(meta["product"])
+        else:
+            stock[key] = {}
+    need_stock_pw = [e for e in emails if e not in pws]
+    if need_stock_pw:
+        stock_pw = _gm_chk_stock_pw()
+    rows = []
+    for em in emails:
+        ek = _gm_ekey(em)
+        used = [label[k] for k in GMAIL_PLATFORMS if ek in sold[k]]
+        instock = [label[k] for k in GMAIL_PLATFORMS if ek in stock[k]]
+        dups = []
+        if counts.get(em, 1) > 1:
+            dups.append(f"ইনপুটে {counts[em]} বার আছে")
+        for k in GMAIL_PLATFORMS:
+            n = stock[k].get(ek, 0)
+            if n > 1:
+                dups.append(f"{label[k]} স্টকে {n} বার")
+            if n and ek in sold[k]:
+                dups.append(f"{label[k]}: বিক্রি হয়েও স্টকে আছে ⚠️")
+        status = "used" if used else ("stock" if instock else "free")
+        rows.append({"email": em, "status": status, "used": used, "stock": instock, "dups": dups,
+                     "has_pw": bool(em in pws or ek in stock_pw)})
+    return rows
+
+
+def _gm_chk_login_one(em, pw):
+    """IMAP লগইন টেস্ট: ok / fail (ভুল পাসওয়ার্ড/IMAP বন্ধ/ব্লক) / error (নেটওয়ার্ক/টাইমআউট)।"""
+    M = None
+    try:
+        try:
+            M = imaplib.IMAP4_SSL("imap.gmail.com", 993, timeout=15)
+        except TypeError:
+            M = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        M.login(em, re.sub(r"\s+", "", str(pw)))
+        return "ok"
+    except imaplib.IMAP4.error:
+        return "fail"
+    except Exception:
+        return "error"
+    finally:
+        try:
+            if M is not None:
+                M.logout()
+        except Exception:
+            pass
+
+
+def _gm_chk_login_many(emails, pws):
+    stock_pw = _gm_chk_stock_pw() if any(e not in pws for e in emails) else {}
+    jobs, out = {}, {}
+    for em in emails:
+        pw = pws.get(em) or stock_pw.get(_gm_ekey(em))
+        if pw:
+            jobs[em] = pw
+        else:
+            out[em] = "nopw"
+    if jobs:
+        with ThreadPoolExecutor(max_workers=_GM_CHK_LOGIN_WORKERS) as ex:
+            futs = {ex.submit(_gm_chk_login_one, em, pw): em for em, pw in jobs.items()}
+            for f in as_completed(futs):
+                try:
+                    out[futs[f]] = f.result()
+                except Exception:
+                    out[futs[f]] = "error"
+    return out
+
+
+@sms_app.route(_GM_CHK_PATH, methods=["GET"])
+def gm_chk_page():
+    # পেজে কোনো ডেটা নেই — ডেটা API থেকে আসে, সেটা admin-only
+    return _gm_web_resp(_GM_CHK_HTML)
+
+
+def _gm_chk_json(obj, status=200):
+    return _gm_web_resp(json.dumps(obj, ensure_ascii=False), status, "application/json")
+
+
+@sms_app.route(_GM_CHK_PATH + "/api", methods=["POST"])
+def gm_chk_api():
+    body = flask_request.get_json(silent=True) or {}
+    if not _gm_chk_auth(body.get("initData", "")):
+        return _gm_chk_json({"ok": False, "error": "Forbidden"}, 403)
+    order, counts, pws = _gm_chk_parse(body.get("text", ""))
+    if not order:
+        return _gm_chk_json({"ok": False, "error": "কোনো সঠিক ইমেইল পাওয়া যায়নি"})
+    cut = len(order) > _GM_CHK_MAX
+    rows = _gm_chk_run(order[:_GM_CHK_MAX], counts, pws)
+    return _gm_chk_json({"ok": True, "rows": rows, "total": len(order), "cut": cut,
+                         "input_lines": sum(counts.values())})
+
+
+@sms_app.route(_GM_CHK_PATH + "/login", methods=["POST"])
+def gm_chk_login_api():
+    body = flask_request.get_json(silent=True) or {}
+    if not _gm_chk_auth(body.get("initData", "")):
+        return _gm_chk_json({"ok": False, "error": "Forbidden"}, 403)
+    _o, _c, pws = _gm_chk_parse(body.get("text", ""))
+    want = []
+    for e in (body.get("emails") or [])[:_GM_CHK_LOGIN_BATCH]:
+        e = str(e).strip().lower()
+        if _GM_EMAIL_RE.match(e) and e not in want:
+            want.append(e)
+    return _gm_chk_json({"ok": True, "login": _gm_chk_login_many(want, pws)})
+
+
+_GM_CHK_HTML = r"""<!doctype html>
+<html lang="bn"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow"><meta name="color-scheme" content="light dark">
+<title>Mail Checker</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#f4f6ff;--card:#fff;--bd:#e3e6f5;--tx:#1d2140;--mut:#7a8099;--pri:#4361ee;--ok:#16a34a;--okbg:#e8f8ee;--er:#d93a3a;--erbg:#fdeaea;--wn:#b7791f;--wnbg:#fff4dc;--pu:#7b3fe4;--pubg:#f0e8ff}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1020;--card:#1b1f3a;--bd:#2b3158;--tx:#eef0ff;--mut:#9aa1c4;--okbg:#12301f;--erbg:#3a1a1f;--wnbg:#3a2d12;--wn:#f0b85a;--pubg:#2a2050;--pu:#b99aff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:16px 14px 40px}
+.w{max-width:560px;margin:0 auto}h1{font-size:20px;margin:4px 0 12px}
+textarea{width:100%;min-height:150px;border:1px solid var(--bd);border-radius:14px;background:var(--card);color:var(--tx);padding:12px;font:13px ui-monospace,Menlo,monospace;resize:vertical}
+button{width:100%;margin-top:10px;border:0;border-radius:14px;background:var(--pri);color:#fff;font-size:16px;font-weight:600;padding:14px}
+button.g{background:var(--card);color:var(--pri);border:1px solid var(--bd);font-size:14px;padding:10px}
+button:disabled{opacity:.6}label.o{display:flex;gap:8px;align-items:center;margin-top:10px;font-size:14px}
+.sum{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:14px 0}.sum div{text-align:center;border-radius:12px;padding:8px 4px;font-size:12px}
+.sum b{display:block;font-size:20px}.c{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:10px 12px;margin-top:8px}
+.em{font-family:ui-monospace,Menlo,monospace;font-size:13px;word-break:break-all}.tag{display:inline-block;font-size:12px;margin:4px 4px 0 0;padding:2px 8px;border-radius:99px}
+.u{background:var(--erbg);color:var(--er)}.s{background:var(--wnbg);color:var(--wn)}.f{background:var(--okbg);color:var(--ok)}.d{background:var(--pubg);color:var(--pu)}.m{color:var(--mut);font-size:12px}
+.n{background:var(--bd);color:var(--mut)}
+</style></head><body><div class="w">
+<h1>🔎 Mail Checker <span class="m">(Admin)</span></h1>
+<textarea id="t" placeholder="প্রতি লাইনে ১টা:&#10;name@gmail.com&#10;name@gmail.com|app_password (লগইন চেকের জন্য)"></textarea>
+<label class="o"><input type="checkbox" id="lg"> 🔐 Mail login চেক করুন (IMAP) — ধীর, প্রতি মেইলে কয়েক সেকেন্ড</label>
+<button id="b">চেক করুন</button>
+<div id="o"></div></div>
+<script>
+const tg=window.Telegram&&Telegram.WebApp;if(tg){tg.ready();tg.expand();}
+const $=id=>document.getElementById(id);
+function el(tag,cls,txt){const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
+const LG={ok:["✅ Login OK","f"],fail:["❌ Login ব্যর্থ","u"],error:["⚠️ চেক হয়নি (নেটওয়ার্ক)","s"],nopw:["🔑 পাসওয়ার্ড নেই","n"],wait:["⏳ Login চেক হচ্ছে…","n"]};
+async function post(path,payload){
+ const r=await fetch(location.pathname+path,{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(Object.assign({initData:tg?tg.initData:""},payload))});
+ return {status:r.status,data:await r.json()};
+}
+$("b").onclick=async()=>{
+ const o=$("o"),text=$("t").value,wantLogin=$("lg").checked,b=$("b");
+ o.textContent="";b.disabled=true;b.textContent="চেক হচ্ছে…";
+ try{
+  const {status,data:d}=await post("/api",{text});
+  if(status===403){o.appendChild(el("div","c","⛔ শুধু অ্যাডমিনের জন্য — বটের Admin Panel থেকে খুলুন"));return;}
+  if(!d.ok){o.appendChild(el("div","c",d.error||"Error"));return;}
+  const n={used:0,stock:0,free:0,dup:0,lgok:0,lgbad:0};
+  d.rows.forEach(x=>{n[x.status]++;if(x.dups.length)n.dup++;});
+  const s=el("div","sum"),cells={};
+  [["used","u","🔴 Used"],["stock","s","🟡 স্টকে"],["free","f","🟢 নতুন"],["dup","d","♻️ Duplicate"]].forEach(([k,c,l])=>{
+   const x=el("div",c);cells[k]=el("b",null,n[k]);x.appendChild(cells[k]);x.appendChild(document.createTextNode(l));s.appendChild(x);});
+  if(wantLogin){[["lgok","f","✅ Login OK"],["lgbad","u","❌ Login ব্যর্থ"]].forEach(([k,c,l])=>{
+   const x=el("div",c);cells[k]=el("b",null,0);x.appendChild(cells[k]);x.appendChild(document.createTextNode(l));s.appendChild(x);});}
+  o.appendChild(s);
+  const info=[];if(d.input_lines>d.total)info.push("ইনপুটে মোট "+d.input_lines+" লাইন, ইউনিক "+d.total+"টা");
+  if(d.cut)info.push("⚠️ প্রথম "+d.rows.length+"টা চেক হয়েছে");
+  if(info.length)o.appendChild(el("div","m",info.join(" • ")));
+  const cp=el("button","g","📋 নতুন (Used নয়, স্টকেও নেই) মেইল কপি");cp.onclick=()=>{
+   const list=d.rows.filter(x=>x.status==="free"&&(!wantLogin||x.lg==="ok"||x.lg===undefined)).map(x=>x.email).join("\n");
+   if(navigator.clipboard)navigator.clipboard.writeText(list);if(tg)tg.showAlert("কপি হয়েছে");};
+  o.appendChild(cp);
+  const box={};
+  d.rows.forEach(x=>{
+   const c=el("div","c");c.appendChild(el("div","em",x.email));
+   if(x.used.length){c.appendChild(el("div","m","বিক্রি হয়েছে:"));x.used.forEach(v=>c.appendChild(el("span","tag u",v)));}
+   if(x.stock.length){c.appendChild(el("div","m","স্টকে আছে:"));x.stock.forEach(v=>c.appendChild(el("span","tag s",v)));}
+   if(x.status==="free")c.appendChild(el("span","tag f","কোনো সার্ভিসে ব্যবহার হয়নি"));
+   x.dups.forEach(v=>c.appendChild(el("span","tag d","♻️ "+v)));
+   if(wantLogin){box[x.email]=el("div");box[x.email].appendChild(el("span","tag n",LG.wait[0]));c.appendChild(box[x.email]);}
+   o.appendChild(c);});
+  if(wantLogin){
+   const todo=d.rows.filter(x=>x.has_pw).map(x=>x.email);
+   d.rows.filter(x=>!x.has_pw).forEach(x=>{x.lg="nopw";box[x.email].textContent="";box[x.email].appendChild(el("span","tag n",LG.nopw[0]));});
+   const byE={};d.rows.forEach(x=>byE[x.email]=x);
+   for(let i=0;i<todo.length;i+=25){
+    const chunk=todo.slice(i,i+25);b.textContent="Login চেক… "+Math.min(i+25,todo.length)+"/"+todo.length;
+    let res;try{res=(await post("/login",{text,emails:chunk})).data;}catch(e){res=null;}
+    chunk.forEach(e=>{const st=(res&&res.ok&&res.login[e])||"error";byE[e].lg=st;
+     box[e].textContent="";box[e].appendChild(el("span","tag "+LG[st][1],LG[st][0]));
+     if(st==="ok")cells.lgok.textContent=+cells.lgok.textContent+1;
+     if(st==="fail")cells.lgbad.textContent=+cells.lgbad.textContent+1;});
+   }
+  }
+ }catch(e){o.appendChild(el("div","c","Network error"));}
+ finally{b.disabled=false;b.textContent="চেক করুন";}
+};
+</script></body></html>"""
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -16222,6 +16534,25 @@ def _handle_realproxy_callback_worker(call):
     data = call.data
     lang = get_user_lang(user_id, db)
     state = _rp_state.setdefault(user_id, {})
+
+    # 🔧 FIX: বট রিস্টার্ট / পুরনো মেসেজের বাটন চাপলে in-memory state খালি থাকে, তখন pkg_id
+    # না থাকায় /parent-proxies API "Missing required parameters: pkg_id" error দিতো।
+    # pkg_id ছাড়া এই ধাপগুলো চালানো যায় না — তাই API কল না করে ইউজারকে আবার শুরু করতে বলা হচ্ছে।
+    _needs_pkg = (
+        data.startswith(("rp_country_", "rp_city_", "rp_provider_", "rp_parent_", "rp_dur_"))
+        or data in ("rp_proto_http", "rp_proto_socks", "rp_confirm",
+                    "rp_back_to_country", "rp_back_to_city", "rp_back_to_provider",
+                    "rp_back_to_parent", "rp_back_to_protocol", "rp_back_to_duration",
+                    "rp_back_to_username", "rp_back_to_password")
+    )
+    if _needs_pkg and not state.get("pkg_id"):
+        _rp_state[user_id] = {}
+        _restart_markup = types.InlineKeyboardMarkup(row_width=1)
+        _restart_markup.add(InlineBtn("🔄 আবার শুরু করুন" if lang == "bn" else "🔄 Start again",
+                                       callback_data="rp_menu_new"))
+        _rp_edit(call, ("⚠️ সেশন শেষ হয়ে গেছে। অনুগ্রহ করে আবার শুরু করুন।" if lang == "bn"
+                        else "⚠️ Session expired. Please start again."), _restart_markup)
+        return
 
     try:
         # ── Cancel — পুরো ফ্লো বাতিল করে Buy Proxy মেনুতে ফিরে যাও ──
@@ -23710,6 +24041,12 @@ def show_admin_panel(user_id):
     markup.add(
         InlineBtn("📮 Bulk API Gmail Stock", style="success", callback_data="admin_gm_bulk_stock")
     )
+    _gm_chk_u = _gm_chk_url()
+    markup.add(
+        InlineBtn("🔎 Mail Checker", style="primary", web_app=types.WebAppInfo(url=_gm_chk_u))
+        if _gm_chk_u else
+        InlineBtn("🔎 Mail Checker", style="primary", callback_data="admin_gm_chk")
+    )
     markup.add(
         InlineBtn("⏳ Gmail Mail Lifetime", style="primary", callback_data="gmlife_menu")
     )
@@ -25966,6 +26303,9 @@ def _callback_worker_impl(call):
 
     elif callback_data == "admin_gm_bulk_stock":
         _gm_bulk_stock_prompt(user_id)
+
+    elif callback_data == "admin_gm_chk":
+        bot.send_message(user_id, "⚠️ Mail Checker চালাতে HTTPS public URL লাগবে (PUBLIC_URL সেট করুন)।")
 
     elif callback_data == "admin_upload_stock":
         products = get_visible_products(db)
@@ -34105,6 +34445,17 @@ def auto_init_sub_products():
                     print(f"✅ Gmail product initialized (v2): {_gp}")
             db.setdefault("settings", {})["gmail_products_init_v2"] = True
             update_db_path("/settings/gmail_products_init_v2", True)
+            changed = True
+
+        # ── 📮 Gmail API — Kalshi সার্ভিস (v3; একবারই; admin ডিলিট করলে ফিরবে না) ──
+        if not (db.get("settings", {}) or {}).get("gmail_products_init_v3"):
+            for _gk in GMAIL_NEW_PLATFORM_KEYS_V3:
+                _gp = GMAIL_PLATFORMS[_gk]["product"]
+                if _gp not in db["products"]:
+                    db["products"][_gp] = 0
+                    print(f"✅ Gmail product initialized (v3): {_gp}")
+            db.setdefault("settings", {})["gmail_products_init_v3"] = True
+            update_db_path("/settings/gmail_products_init_v3", True)
             changed = True
 
         if changed:
