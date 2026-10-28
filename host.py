@@ -843,7 +843,10 @@ def _get_mysql_conn():
     if entry is not None:
         conn = entry[0]
         try:
-            conn.ping()
+            # ⚡ প্রতি query-র আগে ping = প্রতিটা কাজে বাড়তি ১টা network round-trip (MySQL load ~২x)।
+            # এখন শুধু ১৫s+ idle থাকলে ping করি; মাঝে connection মরলে _mysql_retryable নিজেই নতুন নেয়।
+            if _time_module.time() - entry[2] > 15:
+                conn.ping()
             entry[2] = _time_module.time()
             return conn
         except Exception:
@@ -1184,9 +1187,8 @@ class _MySQLRef:
     def _set_whole_section(self, top, value):
         prefix = _SHARD_MAP[top] + ":"
         _mysql_delete_prefixed(prefix)
-        if isinstance(value, dict):
-            for sub_id, sub_val in value.items():
-                _mysql_set_key(f"{prefix}{sub_id}", sub_val)
+        if isinstance(value, dict) and value:
+            _mysql_bulk_upsert(_SHARD_MAP[top], value, chunk_size=500)
         return True
 
     def _update_whole_section(self, top, updates):
@@ -1255,6 +1257,11 @@ class _MySQLRef:
             _mysql_atomic_rw(row_key, lambda cur, _r=remaining: _nested_delete(
                 cur if isinstance(cur, dict) else {}, _r
             ))
+            return True
+        if not remaining:
+            # ⚡ পুরো row overwrite — আগের মান দেখার দরকার নেই, তাই SELECT FOR UPDATE + transaction
+            # (৪-৫টা round-trip) বাদ দিয়ে একটাই UPSERT।
+            _mysql_set_key(row_key, value)
             return True
         _mysql_atomic_rw(row_key, lambda cur, _v=value, _r=remaining: (
             _v if not _r else _nested_set(cur if isinstance(cur, dict) else {}, _r, _v)
@@ -6053,7 +6060,8 @@ if not os.path.exists(STOCK_DIR):
 import zipfile as _zipfile_stock
 import hashlib as _hashlib_stock
 
-_STOCK_SYNC_INTERVAL = 2.0
+_STOCK_SYNC_INTERVAL = float(os.environ.get("STOCK_SYNC_INTERVAL", "5"))
+_STOCK_SYNC_MIN_GAP  = float(os.environ.get("STOCK_SYNC_MIN_GAP", "3"))
 _stock_sync_wake     = threading.Event()
 _stock_sync_pass_lock = threading.Lock()
 _stock_sync_known    = {}   # {file_name: sha256 — MySQL এ যেটা আছে}
@@ -6256,6 +6264,9 @@ def _stock_sync_worker():
             _stock_sync_pass()
         except Exception as e:
             logging.error(f"Stock sync worker error: {e}")
+        # ⚡ প্রতিটা বিক্রিতে পুরো .xlsx (LONGBLOB) আবার MySQL এ লেখা হয় — ৩০০০+ ইউজারে এটাই বড় write load।
+        # তাই দুই sync-এর মাঝে কমপক্ষে _STOCK_SYNC_MIN_GAP সেকেন্ড বিরতি; এর মধ্যে হওয়া সব বদলে একবারেই লেখা হয়।
+        _t_ss.sleep(_STOCK_SYNC_MIN_GAP)
         _stock_sync_wake.wait(_STOCK_SYNC_INTERVAL)
         _stock_sync_wake.clear()
 
@@ -10647,10 +10658,12 @@ _SECTION_CONFIG      = {"products", "product_details", "settings", "promo_codes"
 _SECTION_TXN         = {"sms_pending_trxids", "verified_trxids", "verified_trxids_dates",
                         "trx_attempts", "blocked_trxids", "_pending_refer"}
 
-_TTL_USERS    = 600   # 10 মিনিট — balance update_db_path দিয়ে in-place হয়
-_TTL_DEPOSITS = 120   # 2 মিনিট — deposit status দ্রুত দেখাবে
-_TTL_CONFIG   = 600   # 10 মিনিট — products/settings খুব কম বদলায়
-_TTL_TXN      = 300   # 5 মিনিট
+# ⚡ MySQL load কমাতে TTL বাড়ানো (Render/Railway env var দিয়ে বদলানো যায়)।
+# সব write-ই cache-এ সাথে সাথে patch হয়, তাই বড় TTL-এ stale data দেখানোর ঝুঁকি নেই।
+_TTL_USERS    = int(os.environ.get("TTL_USERS", "1800"))     # 30 মিনিট
+_TTL_DEPOSITS = int(os.environ.get("TTL_DEPOSITS", "300"))   # 5 মিনিট
+_TTL_CONFIG   = int(os.environ.get("TTL_CONFIG", "1800"))    # 30 মিনিট
+_TTL_TXN      = int(os.environ.get("TTL_TXN", "600"))        # 10 মিনিট
 
 # section_name → (data_dict, timestamp)
 _section_cache = {}
@@ -11551,6 +11564,112 @@ def _stock_plain_value(v):
     return str(v).strip()
 
 
+# ═══════════════════════════════════════════════════════════
+# 🛡️ DUPLICATE-SALE CHECKER (MySQL)
+# ═══════════════════════════════════════════════════════════
+# প্রতিটা বিক্রি হওয়া স্টক row এর SHA-256 হ্যাশ MySQL এর bot_stock_sold টেবিলে (PRIMARY KEY)
+# সাথে সাথে লেখা হয়। বিক্রির আগে row টা এখানে আছে কিনা দেখা হয় — থাকলে সেটা আগেই বিক্রি
+# হয়ে গেছে, তাই আর deliver হয় না (স্টক থেকেও বাদ যায়)। ফলে crash/restart এর পর পুরনো
+# স্টক snapshot MySQL থেকে ফিরে এলেও একই account দুইবার বিক্রি হবে না।
+# Delivery ব্যর্থ হলে _restore_stock_file হ্যাশ গুলো ছেড়ে দেয় (আবার বিক্রিযোগ্য হয়)।
+_STOCK_DEDUP_ON     = os.environ.get("STOCK_DEDUP", "1") != "0"
+_STOCK_DEDUP_STRICT = os.environ.get("STOCK_DEDUP_STRICT", "0") == "1"   # 1 = MySQL এ না পৌঁছালে বিক্রিই বন্ধ
+_stock_sold_local = set()          # MySQL সাময়িক বন্ধ থাকলেও এই process এর ভেতরে duplicate ঠেকায়
+_stock_sold_ready = False
+
+
+def _stock_row_hash(product_name, row, n_cols):
+    r = [str(c) for c in row]
+    r = (r + [""] * max(0, n_cols - len(r)))[:n_cols]
+    raw = product_name + "\x1f" + "\x1e".join(r)
+    return _hashlib_stock.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@_mysql_retryable
+def _stock_sold_ensure_table():
+    global _stock_sold_ready
+    if _stock_sold_ready:
+        return
+    conn = _get_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_stock_sold (
+                item_hash CHAR(64) PRIMARY KEY,
+                product   VARCHAR(191) NOT NULL,
+                sold_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+    _stock_sold_ready = True
+
+
+@_mysql_retryable
+def _stock_sold_claim_mysql(product_name, hashes):
+    """hashes (ক্রমানুযায়ী) → যেগুলো আগেই বিক্রি হয়েছে তাদের set। নতুনগুলো এই call এই claim হয়ে যায়।"""
+    _stock_sold_ensure_table()
+    conn = _get_mysql_conn()
+    dups = set()
+    uniq = list(dict.fromkeys(hashes))
+    with conn.cursor() as cur:
+        for i in range(0, len(uniq), 500):
+            chunk = uniq[i:i + 500]
+            cur.execute("SELECT item_hash FROM bot_stock_sold WHERE item_hash IN (%s)"
+                        % ",".join(["%s"] * len(chunk)), chunk)
+            dups.update(r[0] for r in cur.fetchall())
+        fresh = [(h, product_name) for h in uniq if h not in dups]
+        for i in range(0, len(fresh), 500):
+            cur.executemany("INSERT IGNORE INTO bot_stock_sold (item_hash, product) VALUES (%s,%s)",
+                            fresh[i:i + 500])
+    return dups
+
+
+def _stock_sold_claim(product_name, rows, n_cols):
+    """rows থেকে (বিক্রিযোগ্য rows, duplicate সংখ্যা) রিটার্ন করে।"""
+    if not _STOCK_DEDUP_ON or not rows:
+        return list(rows), 0
+    hashes = [_stock_row_hash(product_name, r, n_cols) for r in rows]
+    try:
+        dups = _stock_sold_claim_mysql(product_name, hashes)
+    except Exception as e:
+        logging.error(f"Stock dedup MySQL check failed [{product_name}]: {e}")
+        if _STOCK_DEDUP_STRICT:
+            raise
+        dups = set()
+    ok, seen, dup_n = [], set(), 0
+    for r, h in zip(rows, hashes):
+        if h in dups or h in seen or h in _stock_sold_local:
+            dup_n += 1
+            continue
+        seen.add(h)
+        ok.append(r)
+    _stock_sold_local.update(seen)
+    if dup_n:
+        logging.warning(f"🛡️ Duplicate sale blocked: {product_name} | {dup_n} row আগেই বিক্রি হয়েছে — skip")
+    return ok, dup_n
+
+
+@_mysql_retryable
+def _stock_sold_release_mysql(hashes):
+    _stock_sold_ensure_table()
+    conn = _get_mysql_conn()
+    with conn.cursor() as cur:
+        for i in range(0, len(hashes), 500):
+            chunk = hashes[i:i + 500]
+            cur.execute("DELETE FROM bot_stock_sold WHERE item_hash IN (%s)"
+                        % ",".join(["%s"] * len(chunk)), chunk)
+
+
+def _stock_sold_release(product_name, rows, n_cols):
+    """Delivery ব্যর্থ — rows গুলো আবার বিক্রিযোগ্য করো।"""
+    if not _STOCK_DEDUP_ON or not rows:
+        return
+    hashes = list(dict.fromkeys(_stock_row_hash(product_name, r, n_cols) for r in rows))
+    _stock_sold_local.difference_update(hashes)
+    try:
+        _stock_sold_release_mysql(hashes)
+    except Exception as e:
+        logging.error(f"Stock dedup release FAILED [{product_name}] — {len(hashes)} row 'বিক্রিত' হিসেবে আটকে থাকতে পারে: {e}")
+
+
 def read_stock_file(product_name, quantity):
     """
     xlsx stock file থেকে `quantity` টা row পড়ে:
@@ -11573,23 +11692,46 @@ def read_stock_file(product_name, quantity):
         ws = wb.active
 
         header_raw = None
-        collected_rows = []     # delivered (plain text)
-        remaining_rows = []     # stock এ থেকে যাবে (plain text, খালি row বাদ)
+        all_rows = []           # সব data row (plain text, খালি row বাদ)
         for ri, row in enumerate(ws.iter_rows(values_only=True), start=1):
             if ri == 1:
                 header_raw = list(row)
                 continue
             if not any(c is not None and str(c).strip() != "" for c in row):
                 continue
-            if len(collected_rows) < quantity:
-                collected_rows.append([_stock_plain_value(c) for c in row])
-            else:
-                remaining_rows.append([_stock_plain_value(c) for c in row])
+            all_rows.append([_stock_plain_value(c) for c in row])
         wb.close()
 
-        if header_raw is None or not collected_rows:
+        if header_raw is None:
             return None
         header_data = [_stock_plain_value(c) for c in header_raw]
+        n_cols_h = len(header_data)
+
+        # 🛡️ Duplicate-sale checker: আগেই বিক্রি হওয়া row বাদ দিয়ে পরের row নাও
+        collected_rows = []     # delivered
+        pos = 0
+        while len(collected_rows) < quantity and pos < len(all_rows):
+            batch = all_rows[pos:pos + (quantity - len(collected_rows))]
+            pos += len(batch)
+            ok_rows, _dup_n = _stock_sold_claim(product_name, batch, n_cols_h)
+            collected_rows.extend(ok_rows)
+        remaining_rows = all_rows[pos:]   # বাকি stock; আগেই-বিক্রিত dup গুলো স্টক থেকে বাদ
+
+        if not collected_rows:
+            # সব dup ছিল — স্টক ফাইল পরিষ্কার করে রাখো
+            if pos > 0:
+                tmp_path = path + ".tmp"
+                out_wb = openpyxl.Workbook(write_only=True)
+                out_ws = out_wb.create_sheet(title="Sheet1")
+                out_ws.append(header_data)
+                for r in remaining_rows:
+                    out_ws.append(r)
+                out_wb.save(tmp_path)
+                out_wb.close()
+                os.replace(tmp_path, path)
+                _local_count_prime(product_name, len(remaining_rows))
+                invalidate_stock_cache(product_name)
+            return None
 
         # বাকি stock নতুন ফাইলে একবারে লিখে atomic replace
         tmp_path = path + ".tmp"
@@ -11638,6 +11780,7 @@ def _restore_stock_file(product_name, csv_stream):
             return
         header    = reader[0]
         data_rows = reader[1:]
+        _stock_sold_release(product_name, data_rows, len(header))   # 🛡️ আবার বিক্রিযোগ্য
 
         existing = []
         if os.path.exists(path):
@@ -23682,7 +23825,9 @@ def admin_data_load_receive_file(message):
     _DATA_LOAD_PENDING[user_id] = {k: payload[k] for k in found_keys}
 
     preview = "\n".join(f"✅ {k}" for k in found_keys)
-    skip_preview = ("\n\n🚫 <b>Skip হবে (unknown/sensitive key):</b>\n" + "\n".join(f"• {k}" for k in skipped_keys)) if skipped_keys else ""
+    # ⚠️ Telegram মেসেজ লিমিট 4096 char — skipped key অনেক (gm_item:*, gm_user:* ...) হলে
+    # পুরো লিস্ট দিলে send_message fail করত এবং ফাইল "নিচ্ছে না" মনে হতো। তাই শুধু সারাংশ।
+    skip_preview = (f"\n\n🚫 <b>Skip হবে:</b> {len(skipped_keys)}টা অন্য key (users, deposits, gm_*, verified_trxids ইত্যাদি)") if skipped_keys else ""
     text = (
         f"📥 <b>Preset পাওয়া গেছে — Restore করার আগে Confirm করুন</b>\n\n"
         f"<b>Import হবে ({len(found_keys)}টা):</b>\n{preview}"
@@ -23696,6 +23841,8 @@ def admin_data_load_receive_file(message):
         InlineBtn("✅ Confirm & Restore", style="success", callback_data="admin_data_load_confirm"),
         InlineBtn("❌ Cancel", style="danger", callback_data="admin_data_load_cancel"),
     )
+    if len(text) > 4000:
+        text = text[:3990] + "…"
     bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
 
 def show_admin_panel(user_id):
