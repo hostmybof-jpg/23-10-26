@@ -485,6 +485,11 @@ _BROADCAST_EXECUTOR = ThreadPoolExecutor(max_workers=25, thread_name_prefix="bro
 # কোনো keyboard বাটন ক্লিক আর ভারী ব্যাকগ্রাউন্ড টাস্কের পেছনে লাইনে দাঁড়িয়ে থাকবে না।
 _UI_EXECUTOR = ThreadPoolExecutor(max_workers=32, thread_name_prefix="ui_worker")
 
+# 🆕 FIX: শুধু MySQL async-write এর জন্য আলাদা pool। আগে update_db_path() ও বাকি DB write
+# মূল _EXECUTOR (16 worker) এ যেত — edusync একসাথে শত শত write দিলে বা MySQL আটকে গেলে
+# webhook update প্রসেসিংয়ের থ্রেডও শেষ হয়ে যেত → বট চুপ, কিন্তু webhook 200 দিত।
+_DB_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="db_writer")
+
 # ═══════════════════════════════════════════════════════════
 # 🛑 GRACEFUL SHUTDOWN — Redeploy/Restart এ pending MySQL write হারানো ঠেকাতে
 # ═══════════════════════════════════════════════════════════
@@ -507,7 +512,10 @@ def _graceful_shutdown(signum, frame):
     try:
         logging.info(f"⚠️ Shutdown signal ({signum}) পাওয়া গেছে — pending MySQL write flush করা হচ্ছে...")
         print(f"⚠️ Shutdown signal ({signum}) — flushing pending MySQL writes before exit...")
-        _EXECUTOR.shutdown(wait=True, cancel_futures=False)
+        for _pool in (_EXECUTOR, _DB_EXECUTOR):
+            _st = threading.Thread(target=lambda p=_pool: p.shutdown(wait=True, cancel_futures=False), daemon=True)
+            _st.start()
+            _st.join(timeout=15)   # আটকে থাকা worker থাকলে ১৫ সেকেন্ডের বেশি অপেক্ষা নয়
         try:
             stock_sync_flush_all()   # 💾 লোকাল স্টক ফাইল MySQL এ শেষবার সেভ
         except Exception as _sf_e:
@@ -803,7 +811,8 @@ _SHARD_MAP = {"users": "user", "deposit_requests": "deposit"}
 # এখন: সব connection registry তে track হয়; মরা থ্রেড ও idle connection বন্ধ করা হয়;
 # মোট সংখ্যা MYSQL_MAX_CONNS এর মধ্যে রাখা হয়; 1040 এলে purge করে retry করা হয়।
 _MYSQL_MAX_CONNS   = int(os.environ.get("MYSQL_MAX_CONNS", "15"))
-_MYSQL_IDLE_SECS   = int(os.environ.get("MYSQL_IDLE_SECS", "20"))
+_MYSQL_IDLE_SECS   = int(os.environ.get("MYSQL_IDLE_SECS", "120"))
+_MYSQL_READ_TIMEOUT = int(os.environ.get("MYSQL_READ_TIMEOUT", "60"))  # 🆕 socket hang ঠেকাতে
 _mysql_registry    = {}   # {thread_ident: [conn, thread_obj, last_used]}
 _mysql_reg_lock    = _mysql_threading.RLock()
 
@@ -856,13 +865,14 @@ def _get_mysql_conn():
         with _mysql_reg_lock:
             over = len(_mysql_registry) >= _MYSQL_MAX_CONNS
         if over:
-            _mysql_purge(force_idle=2)   # সীমা পার হলে ২ সেকেন্ডের বেশি idle গুলোও বন্ধ
+            _mysql_purge(force_idle=60)   # 🆕 সীমা পার হলে ৬০s+ idle গুলো বন্ধ (আগে ২s — চলমান query কেটে দিত)
         try:
             conn = pymysql.connect(
                 host=_MYSQL_HOST, port=_MYSQL_PORT, user=_MYSQL_USER,
                 password=_MYSQL_PASSWORD, database=_MYSQL_DATABASE,
                 ssl=_ssl_ctx, autocommit=True, charset="utf8mb4",
                 connect_timeout=10,
+                read_timeout=_MYSQL_READ_TIMEOUT, write_timeout=_MYSQL_READ_TIMEOUT,
             )
             with _mysql_reg_lock:
                 _mysql_registry[me] = [conn, _mysql_threading.current_thread(), _time_module.time()]
@@ -870,11 +880,39 @@ def _get_mysql_conn():
         except pymysql.err.OperationalError as e:
             last_err = e
             if e.args and e.args[0] == 1040:      # Too many connections
-                _mysql_purge(force_idle=1)
+                _mysql_purge(force_idle=30)
                 _time_module.sleep(0.3 * (attempt + 1))
                 continue
             raise
     raise last_err
+
+import functools as _functools_mysql
+_MYSQL_CONN_ERRORS = (pymysql.err.OperationalError, pymysql.err.InterfaceError,
+                      AttributeError, ValueError, OSError)
+
+def _mysql_drop_conn():
+    """বর্তমান থ্রেডের (ভাঙা/বন্ধ) connection ফেলে দাও — পরের কলে নতুন connection হবে।"""
+    me = _mysql_threading.get_ident()
+    with _mysql_reg_lock:
+        entry = _mysql_registry.pop(me, None)
+    if entry is not None:
+        _mysql_close_quiet(entry[0])
+
+def _mysql_retryable(fn):
+    """'I/O operation on closed file' / 'NoneType has no attribute read' / 2006 / 2013 ধরনের
+    connection error এ নতুন connection নিয়ে আবার চেষ্টা (সব ফাংশনই idempotent)।"""
+    @_functools_mysql.wraps(fn)
+    def wrapper(*a, **k):
+        last = None
+        for i in range(3):
+            try:
+                return fn(*a, **k)
+            except _MYSQL_CONN_ERRORS as e:
+                last = e
+                _mysql_drop_conn()
+                _time_module.sleep(0.1 * (i + 1))
+        raise last
+    return wrapper
 
 def _mysql_idle_reaper():
     """ব্যাকগ্রাউন্ডে নিয়মিত মরা/idle connection পরিষ্কার করে।"""
@@ -917,6 +955,7 @@ def _mysql_migrate_to_sharded():
         except Exception as e:
             logging.error(f"MySQL migration error [{top}]: {e}")
 
+@_mysql_retryable
 def _mysql_get_key(key):
     conn = _get_mysql_conn()
     with conn.cursor() as cur:
@@ -929,6 +968,7 @@ def _mysql_get_key(key):
     except Exception:
         return None
 
+@_mysql_retryable
 def _mysql_set_key(key, value):
     conn = _get_mysql_conn()
     payload = json.dumps(value, ensure_ascii=False)
@@ -939,11 +979,13 @@ def _mysql_set_key(key, value):
             (key, payload)
         )
 
+@_mysql_retryable
 def _mysql_delete_key(key):
     conn = _get_mysql_conn()
     with conn.cursor() as cur:
         cur.execute("DELETE FROM bot_data WHERE data_key=%s", (key,))
 
+@_mysql_retryable
 def _mysql_get_all():
     """শুধু non-sharded top-level keys (products/settings/... ইত্যাদি)।"""
     conn = _get_mysql_conn()
@@ -961,6 +1003,7 @@ def _mysql_get_all():
             result[k] = None
     return result
 
+@_mysql_retryable
 def _mysql_get_all_prefixed(prefix):
     conn = _get_mysql_conn()
     with conn.cursor() as cur:
@@ -974,11 +1017,13 @@ def _mysql_get_all_prefixed(prefix):
             result[k] = None
     return result
 
+@_mysql_retryable
 def _mysql_delete_prefixed(prefix):
     conn = _get_mysql_conn()
     with conn.cursor() as cur:
         cur.execute("DELETE FROM bot_data WHERE data_key LIKE %s", (prefix + "%",))
 
+@_mysql_retryable
 def _mysql_bulk_upsert(prefix, items: dict, chunk_size=500):
     """⚡ অনেকগুলো row একসাথে (batched executemany + একটাই transaction) upsert করে —
     প্রতি key আলাদা network round-trip না করে, তাই হাজার হাজার row-ও কয়েক
@@ -1048,6 +1093,8 @@ def _mysql_atomic_rw(key, mutate_fn, retries=3):
                 conn.rollback()
             except Exception:
                 pass
+            if isinstance(e, _MYSQL_CONN_ERRORS):
+                _mysql_drop_conn()   # 🆕 ভাঙা connection পরের attempt এ আর ব্যবহার হবে না
             logging.error(f"MySQL atomic_rw retry [{key}] attempt {attempt+1}: {e}")
             _time_module.sleep(0.05 * (attempt + 1))
         finally:
@@ -1199,6 +1246,16 @@ class _MySQLRef:
         if top in _SHARD_MAP and len(self.parts) == 1:
             return self._set_whole_section(top, value)
         row_key, remaining = self._resolve_row()
+        if value is None:
+            # 🆕 FIX: Firebase এ set(None) মানে delete। MySQL এ আগে "null" লিখে রাখত →
+            # key থেকে যেত (None মান নিয়ে), ফলে `key.split` এ প্রতি sync এ error।
+            if not remaining:
+                _mysql_delete_key(row_key)
+                return True
+            _mysql_atomic_rw(row_key, lambda cur, _r=remaining: _nested_delete(
+                cur if isinstance(cur, dict) else {}, _r
+            ))
+            return True
         _mysql_atomic_rw(row_key, lambda cur, _v=value, _r=remaining: (
             _v if not _r else _nested_set(cur if isinstance(cur, dict) else {}, _r, _v)
         ))
@@ -6236,6 +6293,93 @@ def get_now_short():
 
 bot = telebot.TeleBot(API_TOKEN, threaded=True, num_threads=32, colorful_logs=False)
 
+# ═══════════════════════════════════════════════════════════
+# 🛡️ TELEBOT WORKER PROTECTION  (বট "নিজে নিজে বন্ধ" হওয়ার মূল কারণ)
+# ═══════════════════════════════════════════════════════════
+# webhook mode + threaded=True তে কোনো handler এ uncaught exception হলে telebot এর
+# worker থ্রেড চিরতরে block হয়ে যায় (continue_event.wait(), polling loop নেই বলে কেউ জাগায় না)।
+# ৩২টা worker এভাবে মরলে কোনো update আর প্রসেস হয় না — অথচ Flask 200 দিতে থাকে ও /health ok।
+# সমাধান: (১) handler এর exception এখানেই ধরে log করা, (২) আটকে যাওয়া worker কে জাগানো,
+# (৩) stall হলে /health 503 + (চরম অবস্থায়) প্রসেস রিস্টার্ট।
+import time as _tb_time
+_TB_LOCK = threading.Lock()
+_TB_PENDING = 0
+_TB_LAST_PROGRESS = _tb_time.time()
+_STALL_HEALTH_SECS = int(os.environ.get("STALL_HEALTH_SECS", "120"))
+_STALL_EXIT_SECS   = int(os.environ.get("STALL_EXIT_SECS", "300"))   # 0 = auto-restart বন্ধ
+_STALL_MIN_PENDING = int(os.environ.get("STALL_MIN_PENDING", "5"))
+
+if hasattr(bot, "_exec_task"):
+    _tb_orig_exec_task = bot._exec_task
+
+    def _tb_safe_exec_task(task, *args, **kwargs):
+        global _TB_PENDING, _TB_LAST_PROGRESS
+        def _wrapped(*a, **k):
+            global _TB_PENDING, _TB_LAST_PROGRESS
+            try:
+                task(*a, **k)
+            except Exception:
+                logging.error("❌ handler exception (swallowed — telebot worker বাঁচানো হলো):\n" + traceback.format_exc())
+            finally:
+                with _TB_LOCK:
+                    _TB_PENDING = max(0, _TB_PENDING - 1)
+                    _TB_LAST_PROGRESS = _tb_time.time()
+        with _TB_LOCK:
+            if _TB_PENDING == 0:
+                _TB_LAST_PROGRESS = _tb_time.time()
+            _TB_PENDING += 1
+        try:
+            return _tb_orig_exec_task(_wrapped, *args, **kwargs)
+        except Exception:
+            with _TB_LOCK:
+                _TB_PENDING = max(0, _TB_PENDING - 1)
+            raise
+
+    bot._exec_task = _tb_safe_exec_task
+
+def _tb_stalled_for():
+    """pending update আছে অথচ কোনো progress নেই — কত সেকেন্ড। stall না থাকলে 0।"""
+    with _TB_LOCK:
+        if _TB_PENDING >= _STALL_MIN_PENDING:
+            return _tb_time.time() - _TB_LAST_PROGRESS
+    return 0
+
+def _tb_worker_reviver():
+    """exception এ আটকে যাওয়া telebot worker গুলোকে জাগায় (দ্বিতীয় সুরক্ষা)।"""
+    while True:
+        _tb_time.sleep(5)
+        try:
+            pool = getattr(bot, "worker_pool", None)
+            for w in (getattr(pool, "workers", None) or []):
+                ev = getattr(w, "exception_event", None)
+                ce = getattr(w, "continue_event", None)
+                if ev is not None and ce is not None and ev.is_set():
+                    logging.warning("⚠️ telebot worker আটকে ছিল — জাগানো হলো")
+                    ev.clear()
+                    ce.set()
+            if pool is not None and getattr(pool, "exception_event", None) is not None:
+                pool.exception_event.clear()
+        except Exception:
+            pass
+
+def _stall_watchdog():
+    while True:
+        _tb_time.sleep(15)
+        try:
+            st = _tb_stalled_for()
+            if st > _STALL_HEALTH_SECS:
+                logging.error(f"🚨 BOT STALL: {_TB_PENDING} update pending, {int(st)}s ধরে কোনো progress নেই")
+            if _STALL_EXIT_SECS and st > _STALL_EXIT_SECS:
+                logging.critical("🚨 BOT STALL এ restart করা হচ্ছে (platform auto-restart করবে)")
+                _t = threading.Thread(target=lambda: _DB_EXECUTOR.shutdown(wait=True), daemon=True)
+                _t.start(); _t.join(10)
+                os._exit(1)
+        except Exception:
+            pass
+
+threading.Thread(target=_tb_worker_reviver, daemon=True, name="tb_worker_reviver").start()
+threading.Thread(target=_stall_watchdog, daemon=True, name="stall_watchdog").start()
+
 # ══════════════════════════════════════════════════════
 # 💎 PREMIUM (CUSTOM) EMOJI — সর্বত্র (v2)
 # ──────────────────────────────────────────────────────
@@ -7520,7 +7664,10 @@ WEBHOOK_URL  = RAILWAY_URL + WEBHOOK_PATH
 
 @sms_app.route('/health', methods=['GET'])
 def health_check():
-    """Railway health check endpoint."""
+    """Railway health check endpoint. 🆕 bot stall করলে 503 (আগে সবসময় ok দিত)।"""
+    _st = _tb_stalled_for()
+    if _st > _STALL_HEALTH_SECS:
+        return {"status": "stalled", "pending": _TB_PENDING, "stalled_for_s": int(_st)}, 503
     return {"status": "ok", "bot": "running"}, 200
 
 @sms_app.route('/sms', methods=['GET'])
@@ -9540,7 +9687,7 @@ def mark_trxid_used(db, trx_id):
     if "verified_trxids_dates" not in db:
         db["verified_trxids_dates"] = {}
     db["verified_trxids_dates"][trx_id] = get_now()
-    _EXECUTOR.submit(_update_db_path_sync, f"/verified_trxids_dates/{trx_id}", get_now())
+    _DB_EXECUTOR.submit(_update_db_path_sync, f"/verified_trxids_dates/{trx_id}", get_now())
 
 def _cleanup_old_sms_pending():
     """৩০ দিনের বেশি পুরনো sms_pending_trxids এন্ট্রি মুছে ফেলো।"""
@@ -9677,7 +9824,7 @@ def cleanup_old_verified_trxids(db=None):
         db.get("verified_trxids_dates", {}).pop(trx_id, None)
         _fb_ref(f"/verified_trxids_dates/{trx_id}").delete()
     # পুরো verified_trxids লিস্ট re-write করো (index-based dict হিসেবে সেভ হয়)
-    _EXECUTOR.submit(_update_db_path_sync, "/verified_trxids",
+    _DB_EXECUTOR.submit(_update_db_path_sync, "/verified_trxids",
                      {str(i): v for i, v in enumerate(db.get("verified_trxids", []))})
     _update_db_cache_in_place(db)
     logging.info(f"🧹 Verified TrxID cleanup: {len(to_delete)} টা {DATA_RETENTION_DAYS} দিনের পুরনো trxid মুছে ফেলা হয়েছে।")
@@ -10295,7 +10442,7 @@ def save_db(data, _async=True):
     """
     _update_db_cache_in_place(data)
     if _async:
-        _EXECUTOR.submit(_save_db_sync, data)
+        _DB_EXECUTOR.submit(_save_db_sync, data)
         return True
     return _save_db_sync(data)
 
@@ -10381,9 +10528,16 @@ def update_db_path(path, value, _async=True):
     # path থেকে top-level key বের করে cache update করো
     _patch_cache_for_path(path, value)
     if _async:
-        _EXECUTOR.submit(_update_db_path_sync, path, value)
+        _DB_EXECUTOR.submit(_update_db_path_sync, path, value)
         return True
     return _update_db_path_sync(path, value)
+
+def _cache_put(d, k, v):
+    """None মানে delete (Firebase semantics) — cache এ None tombstone রাখে না।"""
+    if v is None:
+        d.pop(k, None)
+    else:
+        d[k] = v
 
 def _patch_cache_for_path(path, value):
     """Cache তে specific path update করো — section cache এ directly patch।
@@ -10402,16 +10556,16 @@ def _patch_cache_for_path(path, value):
             sec_data = cached[0]
             if len(parts) == 1:
                 # /users → পুরো top-level replace
-                sec_data[top] = value
+                _cache_put(sec_data, top, value)
             elif len(parts) == 2 and top in sec_data and isinstance(sec_data[top], dict):
                 # /users/12345 → user object replace
-                sec_data[top][parts[1]] = value
+                _cache_put(sec_data[top], parts[1], value)
             elif (len(parts) == 3
                   and top in sec_data
                   and isinstance(sec_data.get(top), dict)
                   and isinstance(sec_data[top].get(parts[1]), dict)):
                 # /users/12345/balance → শুধু balance field update
-                sec_data[top][parts[1]][parts[2]] = value
+                _cache_put(sec_data[top][parts[1]], parts[2], value)
             else:
                 # অজানা deep path — এই section invalidate করো
                 _section_cache.pop(section, None)
@@ -10419,13 +10573,13 @@ def _patch_cache_for_path(path, value):
             # _db_cache ও sync করো (backward compat)
             if _db_cache is not None:
                 if len(parts) == 1:
-                    _db_cache[top] = value
+                    _cache_put(_db_cache, top, value)
                 elif len(parts) == 2 and top in _db_cache and isinstance(_db_cache[top], dict):
-                    _db_cache[top][parts[1]] = value
+                    _cache_put(_db_cache[top], parts[1], value)
                 elif (len(parts) == 3 and top in _db_cache
                       and isinstance(_db_cache.get(top), dict)
                       and isinstance(_db_cache[top].get(parts[1]), dict)):
-                    _db_cache[top][parts[1]][parts[2]] = value
+                    _cache_put(_db_cache[top][parts[1]], parts[2], value)
 
 def _update_db_path_sync(path, value):
     try:
@@ -10456,7 +10610,7 @@ def patch_db_path(path, updates: dict):
     else:
         _invalidate_db_cache()
     try:
-        _EXECUTOR.submit(_fb_ref(path).update, updates)
+        _DB_EXECUTOR.submit(_fb_ref(path).update, updates)
         return True
     except Exception as e:
         logging.error(f"MySQL patch_db_path error [{path}]: {e}")
@@ -11708,10 +11862,10 @@ def _vpn_delete_product_everywhere(db, cat_data, product_name):
         _vpn_save_category_list(db, cat_data, products)
     if product_name in db.get("products", {}):
         del db["products"][product_name]
-        _EXECUTOR.submit(lambda: _fb_ref(f"/products/{product_name}").delete())
+        _DB_EXECUTOR.submit(lambda: _fb_ref(f"/products/{product_name}").delete())
     if product_name in db.get("product_details", {}):
         del db["product_details"][product_name]
-        _EXECUTOR.submit(lambda: _fb_ref(f"/product_details/{product_name}").delete())
+        _DB_EXECUTOR.submit(lambda: _fb_ref(f"/product_details/{product_name}").delete())
     _update_db_cache_in_place(db)
     try:
         stock_path = os.path.join(STOCK_DIR, f"{product_name}.xlsx")
@@ -12669,10 +12823,10 @@ def _proxy_delete_product_everywhere(db, provider_key, product_name):
         _proxy_save_provider_list(db, provider_key, products)
     if product_name in db.get("products", {}):
         del db["products"][product_name]
-        _EXECUTOR.submit(lambda: _fb_ref(f"/products/{product_name}").delete())
+        _DB_EXECUTOR.submit(lambda: _fb_ref(f"/products/{product_name}").delete())
     if product_name in db.get("product_details", {}):
         del db["product_details"][product_name]
-        _EXECUTOR.submit(lambda: _fb_ref(f"/product_details/{product_name}").delete())
+        _DB_EXECUTOR.submit(lambda: _fb_ref(f"/product_details/{product_name}").delete())
     _update_db_cache_in_place(db)
     try:
         stock_path = os.path.join(STOCK_DIR, f"{product_name}.xlsx")
@@ -12699,12 +12853,12 @@ def _proxy_rename_product(db, provider_key, old_name, new_display_name):
         price = db["products"].pop(old_name)
         db["products"][new_name] = price
         update_db_path(f"/products/{new_name}", price)
-        _EXECUTOR.submit(lambda: _fb_ref(f"/products/{old_name}").delete())
+        _DB_EXECUTOR.submit(lambda: _fb_ref(f"/products/{old_name}").delete())
     if old_name in db.get("product_details", {}):
         detail = db["product_details"].pop(old_name)
         db["product_details"][new_name] = detail
         update_db_path(f"/product_details/{new_name}", detail)
-        _EXECUTOR.submit(lambda: _fb_ref(f"/product_details/{old_name}").delete())
+        _DB_EXECUTOR.submit(lambda: _fb_ref(f"/product_details/{old_name}").delete())
     _update_db_cache_in_place(db)
     try:
         old_path = os.path.join(STOCK_DIR, f"{old_name}.xlsx")
@@ -19262,7 +19416,7 @@ def update_api_dashboard(product_name, quantity, total_bdt):
         should_flush = _api_dashboard_write_count >= _API_DASHBOARD_WRITE_INTERVAL
 
     if should_flush:
-        _EXECUTOR.submit(_flush_api_dashboard)
+        _DB_EXECUTOR.submit(_flush_api_dashboard)
 
 def _flush_api_dashboard():
     """Pending dashboard changes MySQL এ write করো।"""
@@ -23004,7 +23158,7 @@ def approve_deposit(admin_id, request_id, call):
         update_db_path(f"/users/{user_id}/balance", new_bal, _async=False)
         update_db_path(f"/deposit_requests/{request_id}", req, _async=False)
         # verified_trxids আলাদা update
-        _EXECUTOR.submit(_update_db_path_sync, "/verified_trxids",
+        _DB_EXECUTOR.submit(_update_db_path_sync, "/verified_trxids",
                          {str(i): v for i, v in enumerate(db.get("verified_trxids", []))})
         _update_db_cache_in_place(db)  # cache sync করো
 
@@ -31187,7 +31341,7 @@ def _auto_approve_deposit_locked(db, req_id, req, trx_id, sms_amount):
     # ⚡ OPTIMIZED: পুরো DB write বাদ — শুধু changed paths update করো
     update_db_path(f"/users/{user_id}/balance", new_balance, _async=False)
     update_db_path(f"/deposit_requests/{req_id}", db["deposit_requests"][req_id], _async=False)
-    _EXECUTOR.submit(_update_db_path_sync, "/verified_trxids",
+    _DB_EXECUTOR.submit(_update_db_path_sync, "/verified_trxids",
                      {str(i): v for i, v in enumerate(db.get("verified_trxids", []))})
     _update_db_cache_in_place(db)
 
@@ -31542,7 +31696,7 @@ def _process_sms_inner(sender, body):
             # sms_pending থেকে মুছে দাও (approve এর পরে লাগবে না)
             db["sms_pending_trxids"].pop(trx_id, None)
             # ⚡ OPTIMIZED: পুরো DB write বাদ — শুধু sms_pending update করো
-            _EXECUTOR.submit(_update_db_path_sync, "/sms_pending_trxids", db["sms_pending_trxids"])
+            _DB_EXECUTOR.submit(_update_db_path_sync, "/sms_pending_trxids", db["sms_pending_trxids"])
             _update_db_cache_in_place(db)
             logging.info(f"SMS match found → AUTO APPROVE | TrxID={trx_id} | req_id={matched_req_id} | Amount={matched_amount}")
             auto_approve_deposit(matched_req_id, matched_req, trx_id, matched_amount)
@@ -34214,9 +34368,19 @@ def edu_mail_autosync_run():
 
         db = load_db()
         settings = db.setdefault("settings", {})
-        tracked = dict(settings.get("edu_autosync_items", {}) or {})
-        off_by_sync = dict(settings.get("edu_autosync_off", {}) or {})
-        ignored = dict(settings.get("edu_autosync_ignored", {}) or {})
+        def _clean_flags(_name):
+            # 🆕 পুরনো None "tombstone" বাদ দাও (নাহলে `None.split` error + `pid in dict` ভুল True)
+            _raw = dict(settings.get(_name, {}) or {})
+            _ok = {k_: v_ for k_, v_ in _raw.items() if v_}
+            if len(_ok) != len(_raw):
+                try:
+                    update_db_path(f"/settings/{_name}", dict(_ok))
+                except Exception:
+                    pass
+            return _ok
+        tracked = _clean_flags("edu_autosync_items")
+        off_by_sync = _clean_flags("edu_autosync_off")
+        ignored = _clean_flags("edu_autosync_ignored")
         tracked_keys = set(tracked.values())
         manual_pids = set()
         for k, v in (settings.get("edu_mail_bulkmail_ids", {}) or {}).items():
