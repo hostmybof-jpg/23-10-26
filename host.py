@@ -8039,6 +8039,7 @@ GMAIL_PLATFORMS = {
     "gm_chatgpt":   {"product": "Gmail ChatGPT",   "name": "ChatGPT",   "emoji": "🤖"},
     "gm_claude":    {"product": "Gmail Claude AI", "name": "Claude AI", "emoji": "✨"},
     "gm_kalshi":    {"product": "Gmail Kalshi",    "name": "Kalshi",    "emoji": "📈"},
+    "gm_chamet":    {"product": "Gmail Chamet",    "name": "Chamet",    "emoji": "🎥"},
 }
 # প্রথম ৫টার বাইরে যেগুলো পরে যোগ হয়েছে — পুরোনো DB তেও একবার product বানাতে (gmail_products_init_v2)
 GMAIL_NEW_PLATFORM_KEYS = ["gm_amazon", "gm_whatsapp", "gm_twitter", "gm_discord", "gm_microsoft", "gm_pinterest",
@@ -8046,6 +8047,8 @@ GMAIL_NEW_PLATFORM_KEYS = ["gm_amazon", "gm_whatsapp", "gm_twitter", "gm_discord
                            "gm_reddit", "gm_canva", "gm_chatgpt", "gm_claude"]
 # v3 — Kalshi (পুরোনো DB তে একবার product বানাতে — gmail_products_init_v3)
 GMAIL_NEW_PLATFORM_KEYS_V3 = ["gm_kalshi"]
+# v4 — Chamet (পুরোনো DB তে একবার product বানাতে — gmail_products_init_v4)
+GMAIL_NEW_PLATFORM_KEYS_V4 = ["gm_chamet"]
 GMAIL_PRODUCT_TO_KEY = {m["product"]: k for k, m in GMAIL_PLATFORMS.items()}
 OTP_PAGE_PATH = "/otp"
 
@@ -8078,6 +8081,7 @@ GMAIL_SENDERS = {          # প্ল্যাটফর্ম -> প্রে�
     "gm_chatgpt": ["openai.com"],
     "gm_claude": ["anthropic.com"],
     "gm_kalshi": ["kalshi.com"],
+    "gm_chamet": ["chamet"],                      # "chamet" — ডোমেইনের ভেতরে থাকলেই মিলবে (chamet.com / chametw.com ইত্যাদি)
 }
 
 GMAIL_BOXES = ["INBOX", "[Gmail]/Spam"]
@@ -8101,6 +8105,7 @@ _GM_CODE_RE = {            # প্ল্যাটফর্ম -> কোডে�
     "gm_chatgpt": r"(?<![\d.])(\d{6})(?![\d.])",
     "gm_claude": r"(?<![\d.])(\d{6})(?![\d.])",
     "gm_kalshi": r"(?<![\d.])(\d{6})(?![\d.])",
+    "gm_chamet": r"(?<![\d.])(\d{4,8})(?![\d.])",
 }
 
 def _gm_decode(v):
@@ -34456,6 +34461,17 @@ def auto_init_sub_products():
                     print(f"✅ Gmail product initialized (v3): {_gp}")
             db.setdefault("settings", {})["gmail_products_init_v3"] = True
             update_db_path("/settings/gmail_products_init_v3", True)
+            changed = True
+
+        # ── 📮 Gmail API — Chamet সার্ভিস (v4; একবারই; admin ডিলিট করলে ফিরবে না) ──
+        if not (db.get("settings", {}) or {}).get("gmail_products_init_v4"):
+            for _gk in GMAIL_NEW_PLATFORM_KEYS_V4:
+                _gp = GMAIL_PLATFORMS[_gk]["product"]
+                if _gp not in db["products"]:
+                    db["products"][_gp] = 0
+                    print(f"✅ Gmail product initialized (v4): {_gp}")
+            db.setdefault("settings", {})["gmail_products_init_v4"] = True
+            update_db_path("/settings/gmail_products_init_v4", True)
             changed = True
 
         if changed:
