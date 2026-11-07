@@ -508,23 +508,46 @@ _DB_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="db_writer")
 # platform (Railway/Render/Docker ইত্যাদি) SIGTERM পাঠানোর পর কিছু সময়
 # (grace period, সাধারণত 5-30s) অপেক্ষা করে তারপর SIGKILL পাঠায়, তাই এই
 # সময়ের মধ্যে pending write গুলো flush হয়ে যাওয়ার সুযোগ পায়।
-def _graceful_shutdown(signum, frame):
+_flush_done_lock = threading.Lock()
+_flush_done = False
+
+def _flush_all_pending_writes():
+    """bot বন্ধ হওয়ার আগে সব pending ডেটা MySQL এ লেখো (একবারই চলে)।"""
+    global _flush_done
+    with _flush_done_lock:
+        if _flush_done:
+            return
+        _flush_done = True
     try:
-        logging.info(f"⚠️ Shutdown signal ({signum}) পাওয়া গেছে — pending MySQL write flush করা হচ্ছে...")
-        print(f"⚠️ Shutdown signal ({signum}) — flushing pending MySQL writes before exit...")
+        # ১) API dashboard এর জমে থাকা (১০ purchase এর কম) পরিবর্তন — আগে এগুলো হারাত
+        try:
+            _flush_api_dashboard()
+        except Exception as _fd_e:
+            logging.error(f"dashboard flush on shutdown failed: {_fd_e}")
+        # ২) queue তে থাকা সব async MySQL write
         for _pool in (_EXECUTOR, _DB_EXECUTOR):
             _st = threading.Thread(target=lambda p=_pool: p.shutdown(wait=True, cancel_futures=False), daemon=True)
             _st.start()
-            _st.join(timeout=15)   # আটকে থাকা worker থাকলে ১৫ সেকেন্ডের বেশি অপেক্ষা নয়
+            _st.join(timeout=15)   # আটকে থাকলে ১৫ সেকেন্ডের বেশি অপেক্ষা নয়
+        # ৩) লোকাল স্টক ফাইল
         try:
-            stock_sync_flush_all()   # 💾 লোকাল স্টক ফাইল MySQL এ শেষবার সেভ
+            stock_sync_flush_all()
         except Exception as _sf_e:
             logging.error(f"stock flush on shutdown failed: {_sf_e}")
         print("✅ সব pending MySQL write সম্পন্ন — নিরাপদে বন্ধ হচ্ছে।")
     except Exception as e:
-        logging.error(f"_graceful_shutdown error: {e}")
+        logging.error(f"_flush_all_pending_writes error: {e}")
+
+def _graceful_shutdown(signum, frame):
+    try:
+        logging.info(f"⚠️ Shutdown signal ({signum}) — pending MySQL write flush করা হচ্ছে...")
+        print(f"⚠️ Shutdown signal ({signum}) — flushing pending MySQL writes before exit...")
+        _flush_all_pending_writes()
     finally:
         _sys_for_shutdown.exit(0)
+
+import atexit as _atexit_mod
+_atexit_mod.register(_flush_all_pending_writes)
 
 try:
     signal.signal(signal.SIGTERM, _graceful_shutdown)
@@ -1018,6 +1041,26 @@ def _mysql_get_all_prefixed(prefix):
     return result
 
 @_mysql_retryable
+def _mysql_get_many(keys):
+    """⚡ একসাথে অনেকগুলো key ১টা query তে আনো (আগে প্রতি key = ১টা আলাদা query/round-trip)।
+    যে key DB তে নেই সেটা রেজাল্টে থাকে না।"""
+    keys = list(keys)
+    if not keys:
+        return {}
+    conn = _get_mysql_conn()
+    ph = ",".join(["%s"] * len(keys))
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT data_key, data_value FROM bot_data WHERE data_key IN ({ph})", tuple(keys))
+        rows = cur.fetchall()
+    out = {}
+    for k, v in rows:
+        try:
+            out[k] = json.loads(v) if v is not None else None
+        except Exception:
+            out[k] = None
+    return out
+
+@_mysql_retryable
 def _mysql_delete_prefixed(prefix):
     conn = _get_mysql_conn()
     with conn.cursor() as cur:
@@ -1256,8 +1299,13 @@ class _MySQLRef:
                 cur if isinstance(cur, dict) else {}, _r
             ))
             return True
+        if not remaining:
+            # ⚡ পুরো row replace — আগের মান পড়ার দরকার নেই। আগে: transaction + SELECT FOR UPDATE
+            # + INSERT + commit (৪-৫ round-trip); এখন ১টাই INSERT..ON DUPLICATE KEY UPDATE।
+            _mysql_set_key(row_key, value)
+            return True
         _mysql_atomic_rw(row_key, lambda cur, _v=value, _r=remaining: (
-            _v if not _r else _nested_set(cur if isinstance(cur, dict) else {}, _r, _v)
+            _nested_set(cur if isinstance(cur, dict) else {}, _r, _v)
         ))
         return True
 
@@ -6053,6 +6101,103 @@ if not os.path.exists(STOCK_DIR):
 import zipfile as _zipfile_stock
 import hashlib as _hashlib_stock
 
+# ═══════════════════════════════════════════════════════════
+# 🗄️ LOCAL STOCK — আলাদা MySQL ডাটাবেস (ঐচ্ছিক)
+# ═══════════════════════════════════════════════════════════
+# Environment variable এ local stock এর আলাদা MySQL (Aiven) public URL বসান:
+#   LOCAL_STOCK = mysql://user:password@host:port/dbname?ssl-mode=REQUIRED
+# (নাম হিসেবে LOCAL_STOCK / local_stock / LOCAL_STOCK_URL / LOCAL_STOCK_MYSQL_URL — যেকোনোটা চলবে)
+#
+# • সেট করা থাকলে → সব local stock (.xlsx → bot_stock_files টেবিল) ওই আলাদা DB তে যাবে।
+#   মূল DB (users/products/settings) আগের মতোই MYSQL_URL এ থাকবে।
+# • সেট না থাকলে → আগের মতোই মূল DB তে (কোনো পরিবর্তন নেই)।
+_LOCAL_STOCK_URL = (
+    os.environ.get("LOCAL_STOCK") or os.environ.get("local_stock")
+    or os.environ.get("LOCAL_STOCK_URL") or os.environ.get("LOCAL_STOCK_MYSQL_URL") or ""
+).strip()
+
+_STOCK_DB_MAX_CONNS = int(os.environ.get("LOCAL_STOCK_MAX_CONNS", "5"))
+_stock_db_registry  = {}   # {thread_ident: [conn, thread_obj, last_used]}
+_stock_db_lock      = _mysql_threading.RLock()
+
+if _LOCAL_STOCK_URL:
+    _sp = _urlparse(_LOCAL_STOCK_URL)
+    _STOCK_DB_HOST = _sp.hostname or ""
+    _STOCK_DB_PORT = _sp.port or 3306
+    _STOCK_DB_USER = _urlunquote(_sp.username or "avnadmin")
+    _STOCK_DB_PASS = _urlunquote(_sp.password or "")
+    _STOCK_DB_NAME = (_sp.path or "/defaultdb").lstrip("/") or "defaultdb"
+    print(f"✅ Local stock DB: আলাদা MySQL ব্যবহার হবে (host={_STOCK_DB_HOST}, port={_STOCK_DB_PORT}, db={_STOCK_DB_NAME})")
+else:
+    print("ℹ️ Local stock DB: LOCAL_STOCK সেট নেই — মূল MySQL এ local stock থাকবে")
+
+
+def _stock_db_purge():
+    now = _time_module.time()
+    me = _mysql_threading.get_ident()
+    with _stock_db_lock:
+        for ident in list(_stock_db_registry.keys()):
+            conn, th, last = _stock_db_registry[ident]
+            if (not th.is_alive()) or (ident != me and now - last > _MYSQL_IDLE_SECS):
+                _mysql_close_quiet(conn)
+                _stock_db_registry.pop(ident, None)
+
+
+def _get_stock_conn():
+    """Local stock এর জন্য connection। LOCAL_STOCK সেট থাকলে আলাদা DB, নাহলে মূল DB।"""
+    if not _LOCAL_STOCK_URL:
+        return _get_mysql_conn()
+    me = _mysql_threading.get_ident()
+    with _stock_db_lock:
+        entry = _stock_db_registry.get(me)
+    if entry is not None:
+        try:
+            entry[0].ping()
+            entry[2] = _time_module.time()
+            return entry[0]
+        except Exception:
+            _mysql_close_quiet(entry[0])
+            with _stock_db_lock:
+                _stock_db_registry.pop(me, None)
+
+    import ssl as _ssl_stock
+    _ctx = _ssl_stock.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl_stock.CERT_NONE
+
+    last_err = None
+    for attempt in range(6):
+        _stock_db_purge()
+        with _stock_db_lock:
+            over = len(_stock_db_registry) >= _STOCK_DB_MAX_CONNS
+        if over:
+            now = _time_module.time()
+            with _stock_db_lock:
+                for ident in list(_stock_db_registry.keys()):
+                    if ident != me and now - _stock_db_registry[ident][2] > 30:
+                        _mysql_close_quiet(_stock_db_registry[ident][0])
+                        _stock_db_registry.pop(ident, None)
+        try:
+            conn = pymysql.connect(
+                host=_STOCK_DB_HOST, port=_STOCK_DB_PORT, user=_STOCK_DB_USER,
+                password=_STOCK_DB_PASS, database=_STOCK_DB_NAME,
+                ssl=_ctx, autocommit=True, charset="utf8mb4",
+                connect_timeout=10,
+                read_timeout=max(_MYSQL_READ_TIMEOUT, 120),   # বড় xlsx BLOB এর জন্য বেশি সময়
+                write_timeout=max(_MYSQL_READ_TIMEOUT, 120),
+            )
+            with _stock_db_lock:
+                _stock_db_registry[me] = [conn, _mysql_threading.current_thread(), _time_module.time()]
+            return conn
+        except pymysql.err.OperationalError as e:
+            last_err = e
+            if e.args and e.args[0] == 1040:
+                _time_module.sleep(0.3 * (attempt + 1))
+                continue
+            raise
+    raise last_err
+
+
 _STOCK_SYNC_INTERVAL = 2.0
 _stock_sync_wake     = threading.Event()
 _stock_sync_pass_lock = threading.Lock()
@@ -6069,7 +6214,7 @@ def _stock_sync_kick():
 
 
 def _stock_sync_init_table():
-    conn = _get_mysql_conn()
+    conn = _get_stock_conn()
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS bot_stock_files (
@@ -6092,7 +6237,7 @@ def _stock_sync_list_disk():
             and os.path.isfile(os.path.join(STOCK_DIR, n))]
 
 
-def _stock_sync_push(fname):
+def _stock_sync_push(fname, locked_by_caller=False):
     """একটা stock ফাইল MySQL এ আপলোড (শুধু বদলালে)। True = সফল/অপরিবর্তিত।"""
     path = os.path.join(STOCK_DIR, fname)
     try:
@@ -6103,8 +6248,10 @@ def _stock_sync_push(fname):
     if _stock_sync_sig.get(fname) == sig and fname in _stock_sync_known:
         return True
 
-    lock = get_stock_lock(fname[:-5])
-    got = lock.acquire(timeout=5)
+    # locked_by_caller=True: কল করা ফাংশন (read_stock_file) আগে থেকেই এই product এর lock ধরে
+    # আছে — আবার ধরতে গেলে ৫ সেকেন্ড আটকে যেত (threading.Lock reentrant নয়)।
+    lock = None if locked_by_caller else get_stock_lock(fname[:-5])
+    got = lock.acquire(timeout=5) if lock else False
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -6132,7 +6279,7 @@ def _stock_sync_push(fname):
         _stock_sync_sig[fname] = sig
         return True
 
-    conn = _get_mysql_conn()
+    conn = _get_stock_conn()
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO bot_stock_files (file_name, file_data, file_hash, file_mtime) "
@@ -6147,7 +6294,7 @@ def _stock_sync_push(fname):
 
 
 def _stock_sync_delete(fname):
-    conn = _get_mysql_conn()
+    conn = _get_stock_conn()
     with conn.cursor() as cur:
         cur.execute("DELETE FROM bot_stock_files WHERE file_name=%s", (fname,))
     _stock_sync_known.pop(fname, None)
@@ -6181,6 +6328,59 @@ def _stock_sync_pass():
                     logging.error(f"Stock sync delete error [{fname}]: {e}")
 
 
+def _stock_migrate_from_main_db():
+    """একবারের জন্য: LOCAL_STOCK আলাদা DB সেট থাকলে, মূল MySQL এর bot_stock_files এ
+    থাকা সব stock ফাইল নতুন আলাদা DB তে কপি করে।
+    • নতুন DB তে যে ফাইল আগে থেকেই আছে সেটা overwrite হয় না (INSERT IGNORE)।
+    • মূল DB থেকে কিছু মোছা হয় না (backup হিসেবে থাকে)।
+    • সফল হলে bot_stock_meta তে marker বসে — পরের বুটে আর চলে না, যাতে পরে
+      ইচ্ছে করে মোছা stock আবার ফিরে না আসে।"""
+    if not _LOCAL_STOCK_URL:
+        return
+    dst = _get_stock_conn()
+    with dst.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_stock_meta (
+                meta_key   VARCHAR(100) PRIMARY KEY,
+                meta_value VARCHAR(255),
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        cur.execute("SELECT meta_value FROM bot_stock_meta WHERE meta_key='migrated_from_main'")
+        if cur.fetchone():
+            return
+
+    src = _get_mysql_conn()
+    try:
+        with src.cursor() as cur:
+            cur.execute("SELECT file_name FROM bot_stock_files")
+            names = [r[0] for r in cur.fetchall()]
+    except pymysql.err.ProgrammingError:
+        names = []   # মূল DB তে টেবিলই নেই — কপি করার কিছু নেই
+
+    copied = 0
+    for fname in names:
+        with src.cursor() as cur:
+            cur.execute("SELECT file_data, file_hash, file_mtime FROM bot_stock_files WHERE file_name=%s", (fname,))
+            r = cur.fetchone()
+        if not r:
+            continue
+        with dst.cursor() as cur:
+            cur.execute(
+                "INSERT IGNORE INTO bot_stock_files (file_name, file_data, file_hash, file_mtime) "
+                "VALUES (%s,%s,%s,%s)",
+                (fname, bytes(r[0]), r[1], int(r[2] or 0))
+            )
+            copied += cur.rowcount
+    with dst.cursor() as cur:
+        cur.execute(
+            "INSERT INTO bot_stock_meta (meta_key, meta_value) VALUES ('migrated_from_main', %s) "
+            "ON DUPLICATE KEY UPDATE meta_value=VALUES(meta_value)",
+            (f"{len(names)} files seen, {copied} copied",)
+        )
+    print(f"✅ Local stock migration: মূল MySQL → আলাদা stock DB | মোট {len(names)}টা, নতুন কপি হয়েছে {copied}টা")
+
+
 def stock_sync_restore_from_mysql():
     """Startup: MySQL এ থাকা সব স্টক ফাইল stocks/ এ ফিরিয়ে আনো।
     ডিস্কে একই ফাইল থাকলে যেটার mtime নতুন সেটা জেতে (crash এর আগের শেষ
@@ -6188,7 +6388,8 @@ def stock_sync_restore_from_mysql():
     global _stock_sync_ready
     os.makedirs(STOCK_DIR, exist_ok=True)
     _stock_sync_init_table()
-    conn = _get_mysql_conn()
+    _stock_migrate_from_main_db()   # 🆕 মূল DB র পুরনো stock → আলাদা stock DB (একবার)
+    conn = _get_stock_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT file_name, file_hash, file_mtime FROM bot_stock_files")
         rows = cur.fetchall()
@@ -10838,12 +11039,20 @@ def _safe_set_subkey(section, name, sub, value):
     else:
         update_db_path(f"/{section}/{name}/{sub}", value)
 
+_SYNC_WRITE_TOPS = {"users", "deposit_requests", "dollar_orders", "verified_trxids",
+                    "verified_trxids_dates", "sms_pending_trxids", "blocked_trxids",
+                    "_pending_refer", "banned_users"}
+
 def update_db_path(path, value, _async=True):
     """MySQL এর specific path শুধু update করো (পুরো DB write না করে)।
     ⚡ FAST: cache invalidate না করে — পরের load_db() instant থাকবে।
     """
     # path থেকে top-level key বের করে cache update করো
     _patch_cache_for_path(path, value)
+    # 🔒 গুরুত্বপূর্ণ ডেটা (ব্যালেন্স/অর্ডার/ডিপোজিট/TrxID) — queue তে না রেখে সাথে সাথে MySQL এ লেখো,
+    # যাতে bot যেকোনো মুহূর্তে (crash/kill/redeploy) বন্ধ হলেও latest data MySQL এ থাকে।
+    if _async and path.strip("/").split("/", 1)[0] in _SYNC_WRITE_TOPS:
+        _async = False
     if _async:
         _DB_EXECUTOR.submit(_update_db_path_sync, path, value)
         return True
@@ -10856,47 +11065,43 @@ def _cache_put(d, k, v):
     else:
         d[k] = v
 
+def _apply_path_patch(root, parts, value):
+    """root dict এ parts অনুযায়ী value বসায়/মোছে; মাঝের dict না থাকলে বানিয়ে নেয়।
+    False = path এর মাঝে dict নয় এমন কিছু আছে (patch করা গেল না)।"""
+    node = root
+    for p in parts[:-1]:
+        nxt = node.get(p)
+        if nxt is None:
+            if value is None:
+                return True          # মোছার কিছু নেই
+            nxt = node[p] = {}
+        elif not isinstance(nxt, dict):
+            return False
+        node = nxt
+    _cache_put(node, parts[-1], value)
+    return True
+
 def _patch_cache_for_path(path, value):
-    """Cache তে specific path update করো — section cache এ directly patch।
-    ✅ FIX: 3-level deep path যেমন /users/{id}/balance সরাসরি patch করো।
-    """
-    global _db_cache
+    """Cache তে specific path update করো — যেকোনো depth এ সরাসরি patch।
+    ⚡ আগে: নতুন key / ৪+ লেভেল path এ পুরো section cache মুছে যেত → পরের load_db()
+    এ users (পুরো টেবিল) বা config (~৩০ key) আবার MySQL থেকে নামাতে হতো।
+    এখন শুধু মাঝের পথ dict না হলেই (বিরল) section invalidate হয়।"""
     parts = [p for p in path.strip("/").split("/") if p]
     if not parts:
         return
-    top = parts[0]
-    section = _get_section_name(top)
-
+    section = _get_section_name(parts[0])
     with _section_cache_lock:
         cached = _section_cache.get(section)
-        if cached:
-            sec_data = cached[0]
-            if len(parts) == 1:
-                # /users → পুরো top-level replace
-                _cache_put(sec_data, top, value)
-            elif len(parts) == 2 and top in sec_data and isinstance(sec_data[top], dict):
-                # /users/12345 → user object replace
-                _cache_put(sec_data[top], parts[1], value)
-            elif (len(parts) == 3
-                  and top in sec_data
-                  and isinstance(sec_data.get(top), dict)
-                  and isinstance(sec_data[top].get(parts[1]), dict)):
-                # /users/12345/balance → শুধু balance field update
-                _cache_put(sec_data[top][parts[1]], parts[2], value)
-            else:
-                # অজানা deep path — এই section invalidate করো
-                _section_cache.pop(section, None)
-                return
-            # _db_cache ও sync করো (backward compat)
-            if _db_cache is not None:
-                if len(parts) == 1:
-                    _cache_put(_db_cache, top, value)
-                elif len(parts) == 2 and top in _db_cache and isinstance(_db_cache[top], dict):
-                    _cache_put(_db_cache[top], parts[1], value)
-                elif (len(parts) == 3 and top in _db_cache
-                      and isinstance(_db_cache.get(top), dict)
-                      and isinstance(_db_cache[top].get(parts[1]), dict)):
-                    _cache_put(_db_cache[top][parts[1]], parts[2], value)
+        if not cached:
+            return
+        if not _apply_path_patch(cached[0], parts, value):
+            _section_cache.pop(section, None)
+            return
+        if _db_cache is not None:
+            try:
+                _apply_path_patch(_db_cache, parts, value)
+            except Exception:
+                pass
 
 def _update_db_path_sync(path, value):
     try:
@@ -11026,6 +11231,24 @@ def _load_section(section):
         for key in keys:
             result[key] = _load_one_key(key)
         return result
+    # ⚡ আগে: প্রতি key আলাদা query (config এ ~৩০টা)। এখন: ১টাই query।
+    try:
+        _raw_map = _mysql_get_many(keys)
+        for key in keys:
+            raw = _raw_map.get(key)
+            default_val = _DB_DEFAULT.get(key)
+            if raw is None:
+                result[key] = (list(default_val) if isinstance(default_val, list)
+                               else dict(default_val) if isinstance(default_val, dict)
+                               else (default_val if default_val is not None else {}))
+            elif isinstance(default_val, list):
+                result[key] = _firebase_to_list(raw, list)
+            else:
+                result[key] = raw
+        return result
+    except Exception as e:
+        logging.error(f"MySQL batch load_section [{section}] error, fallback to per-key: {e}")
+        result = {}
     futures = {_EXECUTOR.submit(_load_one_key, key): key for key in keys}
     for future in as_completed(futures):
         key = futures[future]
@@ -11036,6 +11259,7 @@ def _get_cached_section(section):
     """Cache থেকে section নাও, expire হলে MySQL থেকে reload।"""
     now_ts = _time_module.time()
     ttl = _get_section_ttl(section)
+    _section_last_access[section] = now_ts
 
     # Fast path — lock ছাড়া
     cached = _section_cache.get(section)
@@ -11064,6 +11288,9 @@ def _get_cached_section(section):
 # করে না — সবসময় already-warm cache থেকে instant response পায়।
 _CACHE_WARM_BUFFER = 20   # TTL শেষ হওয়ার এই কয় সেকেন্ড আগেই refresh করো
 _CACHE_WARM_INTERVAL = 20  # কত সেকেন্ড পর পর চেক করবে
+_CACHE_WARM_IDLE_LIMIT = 1800   # ⚡ এত সেকেন্ড কেউ DB cache ব্যবহার না করলে warmer refresh বন্ধ রাখে
+_CACHE_WARM_STARTED = _time_module.time()
+_section_last_access = {}       # section → শেষ কখন load_db() এ পড়া হয়েছে
 
 def cache_warmer_worker():
     """Background thread — সব section এর cache কে TTL expire হওয়ার আগেই
@@ -11074,6 +11301,9 @@ def cache_warmer_worker():
             now_ts = _time_module.time()
             for section in ("users", "deposits", "config", "txn"):
                 ttl = _get_section_ttl(section)
+                # ⚡ কেউ ব্যবহার না করলে (idle) শুধু শুধু MySQL থেকে পুরো টেবিল/key নামানো বন্ধ
+                if (now_ts - _section_last_access.get(section, _CACHE_WARM_STARTED)) > _CACHE_WARM_IDLE_LIMIT:
+                    continue
                 cached = _section_cache.get(section)
                 age = (now_ts - cached[1]) if cached else None
                 needs_refresh = (cached is None) or (age >= (ttl - _CACHE_WARM_BUFFER))
@@ -11919,6 +12149,14 @@ def read_stock_file(product_name, quantity):
         out_wb.close()
         os.replace(tmp_path, path)
         _local_count_prime(product_name, len(remaining_rows))   # ⚡ বিক্রির পরের স্টক সাথে সাথে জানা
+        # 🔒 বিক্রি হওয়া row বাদ দেওয়া নতুন স্টক ফাইল MySQL এ *এখনই* সেভ করো (ক্রেতাকে দেওয়ার আগে)।
+        # নইলে সেভ হওয়ার আগেই bot kill/redeploy হলে restart এ পুরনো ফাইল ফিরে আসত →
+        # বিক্রি হয়ে যাওয়া একাউন্ট আবার স্টকে দেখাত (double-sale ঝুঁকি)।
+        try:
+            if _stock_sync_ready:
+                _stock_sync_push(f"{product_name}.xlsx", locked_by_caller=True)
+        except Exception as _ss_e:
+            logging.error(f"sale stock instant MySQL sync failed [{product_name}]: {_ss_e}")
         invalidate_stock_cache(product_name)
 
         # CSV তৈরি করো — plain UTF-8, BOM ছাড়া
@@ -31259,6 +31497,7 @@ def _refresh_flash_worker_impl(call):
 def flash_sale_background_worker():
     """Background thread যা প্রতি মিনিটে flash sale check ও low stock alert করে।"""
     _low_stock_alerted = set()  # একবার alert দেওয়া products track করো
+    _last_sms_cleanup = 0
     while True:
         _time_module.sleep(60)
         check_and_expire_flash_sales()
@@ -31288,7 +31527,9 @@ def flash_sale_background_worker():
 
         # ── ৩০ দিনের পুরনো SMS cleanup (প্রতি ঘণ্টায় একবার) ──
         try:
-            _cleanup_old_sms_pending()
+            if _time_module.time() - _last_sms_cleanup >= 3600:
+                _last_sms_cleanup = _time_module.time()
+                _cleanup_old_sms_pending()
         except Exception as e:
             logging.error(f"SMS cleanup error: {e}")
 
